@@ -24,6 +24,7 @@ export const accountSchema = z.object({
   name: z.string(),
   unified_address: z.string(),
   transparent_address: z.string(),
+  unified_full_viewing_key: z.string().optional(),
   transparent_zatoshi: zatoshi,
   orchard_zatoshi: zatoshi,
 });
