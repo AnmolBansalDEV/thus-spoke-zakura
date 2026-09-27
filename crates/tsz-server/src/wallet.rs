@@ -97,6 +97,28 @@ pub struct RealWallet {
     lightwalletd: String,
 }
 
+/// Database capabilities the send proposal paths share; a single bound keeps
+/// `propose_send` and `quote` from drifting apart.
+trait ProposalDb:
+    WalletWrite
+    + InputSource<Error = <Self as WalletRead>::Error, NoteRef: Copy + Eq + Ord + std::fmt::Display>
+    + WalletRead<
+        AccountId = <Self as InputSource>::AccountId,
+        Error: std::error::Error + Send + Sync + 'static,
+    >
+{
+}
+
+impl<T> ProposalDb for T
+where
+    T: WalletWrite
+        + InputSource<Error = <T as WalletRead>::Error>
+        + WalletRead<AccountId = <T as InputSource>::AccountId>,
+    <T as InputSource>::NoteRef: Copy + Eq + Ord + std::fmt::Display,
+    <T as WalletRead>::Error: std::error::Error + Send + Sync + 'static,
+{
+}
+
 #[derive(Default)]
 struct MemoryBlockCache(StdMutex<BTreeMap<u32, CompactBlock>>);
 
@@ -331,11 +353,7 @@ impl RealWallet {
         amount: Zatoshis,
     ) -> Result<Proposal<StandardFeeRule, <DbT as InputSource>::NoteRef>>
     where
-        DbT: WalletWrite
-            + InputSource<Error = <DbT as WalletRead>::Error>
-            + WalletRead<AccountId = <DbT as InputSource>::AccountId>,
-        <DbT as InputSource>::NoteRef: Copy + Eq + Ord + std::fmt::Display,
-        <DbT as WalletRead>::Error: std::error::Error + Send + Sync + 'static,
+        DbT: ProposalDb,
     {
         let proposal = if source_pool == "transparent" {
             let request = TransactionRequest::new(vec![Payment::new(
@@ -398,6 +416,24 @@ impl RealWallet {
         Ok(proposal)
     }
 
+    fn send_input(
+        &self,
+        from_account: u8,
+        destination: &str,
+    ) -> Result<(u8, AccountUuid, LocalNetwork, Address)> {
+        let account_index = from_account
+            .checked_sub(1)
+            .context("invalid source account")?;
+        let account_id = *self
+            .account_ids
+            .get(account_index as usize)
+            .context("source account does not exist")?;
+        let params = regtest_network();
+        let recipient =
+            Address::decode(&params, destination).context("invalid destination address")?;
+        Ok((account_index, account_id, params, recipient))
+    }
+
     pub async fn send(
         &self,
         seed_hex: &str,
@@ -406,17 +442,9 @@ impl RealWallet {
         destination: &str,
         amount: u64,
     ) -> Result<String> {
-        let account_index = from_account
-            .checked_sub(1)
-            .context("invalid source account")?;
+        let (account_index, account_id, params, recipient) =
+            self.send_input(from_account, destination)?;
         let mut db = self.db.lock().await;
-        let account_id = *self
-            .account_ids
-            .get(account_index as usize)
-            .context("source account does not exist")?;
-        let params = regtest_network();
-        let recipient =
-            Address::decode(&params, destination).context("invalid destination address")?;
         let amount = Zatoshis::from_u64(amount).map_err(|_| anyhow::anyhow!("invalid amount"))?;
         let proposal = Self::propose_send(
             &mut *db,
@@ -477,17 +505,8 @@ impl RealWallet {
         source_pool: &str,
         destination: &str,
     ) -> Result<SendQuote> {
-        let account_index = from_account
-            .checked_sub(1)
-            .context("invalid source account")?;
+        let (_, account_id, params, recipient) = self.send_input(from_account, destination)?;
         let mut db = self.db.lock().await;
-        let account_id = *self
-            .account_ids
-            .get(account_index as usize)
-            .context("source account does not exist")?;
-        let params = regtest_network();
-        let recipient =
-            Address::decode(&params, destination).context("invalid destination address")?;
         Self::quote(&mut *db, &params, account_id, source_pool, &recipient)
     }
 
@@ -499,11 +518,7 @@ impl RealWallet {
         recipient: &Address,
     ) -> Result<SendQuote>
     where
-        DbT: WalletWrite
-            + InputSource<Error = <DbT as WalletRead>::Error>
-            + WalletRead<AccountId = <DbT as InputSource>::AccountId>,
-        <DbT as InputSource>::NoteRef: Copy + Eq + Ord + std::fmt::Display,
-        <DbT as WalletRead>::Error: std::error::Error + Send + Sync + 'static,
+        DbT: ProposalDb,
     {
         if source_pool == "orchard" {
             match propose_send_max_transfer::<_, _, _, Infallible>(
@@ -712,23 +727,27 @@ mod tests {
             .build::<OrchardPoolTester>()
     }
 
-    fn recipient(st: &TestState) -> Address {
+    fn recipient(st: &TestState, pool: &str) -> Address {
         let account_id = st.test_account().unwrap().id();
-        Address::Unified(
-            st.wallet()
-                .get_last_generated_address_matching(
-                    account_id,
-                    UnifiedAddressRequest::AllAvailableKeys,
-                )
-                .unwrap()
-                .unwrap(),
-        )
+        let ua = st
+            .wallet()
+            .get_last_generated_address_matching(
+                account_id,
+                UnifiedAddressRequest::AllAvailableKeys,
+            )
+            .unwrap()
+            .unwrap();
+        if pool == "transparent" {
+            Address::Transparent(*ua.transparent().unwrap())
+        } else {
+            Address::Unified(ua)
+        }
     }
 
-    fn quote(st: &mut TestState, source_pool: &str) -> Result<SendQuote> {
-        let recipient = recipient(st);
+    fn quote(st: &mut TestState, source_pool: &str, destination_pool: &str) -> Result<SendQuote> {
+        let recipient = recipient(st, destination_pool);
         let account_id = st.test_account().unwrap().id();
-        let params = st.wallet().db().params().clone();
+        let params = *st.wallet().db().params();
         RealWallet::quote(
             st.wallet_mut(),
             &params,
@@ -741,8 +760,8 @@ mod tests {
     fn fund_transparent(st: &mut TestState, value: u64) {
         st.add_empty_blocks(10);
         let account_id = st.test_account().unwrap().id();
-        let taddr = match recipient(st) {
-            Address::Unified(ref ua) => *ua.transparent().unwrap(),
+        let taddr = match recipient(st, "transparent") {
+            Address::Transparent(address) => address,
             _ => unreachable!(),
         };
         let utxo = WalletTransparentOutput::from_parts(
@@ -763,7 +782,7 @@ mod tests {
     fn orchard_quote_reports_fee_and_max() {
         let mut st = test_state();
         st.add_notes_checking_balance([[Zatoshis::const_from_u64(100_000_000)]]);
-        let quote = quote(&mut st, "orchard").unwrap();
+        let quote = quote(&mut st, "orchard", "orchard").unwrap();
         assert_eq!(quote.available_zatoshi, 100_000_000);
         assert_eq!(quote.fee_zatoshi, 10_000);
         assert_eq!(quote.max_zatoshi, 99_990_000);
@@ -773,29 +792,63 @@ mod tests {
     fn orchard_quote_max_is_zero_when_balance_only_covers_the_fee() {
         let mut st = test_state();
         st.add_notes_checking_balance([[Zatoshis::const_from_u64(10_000)]]);
-        let quote = quote(&mut st, "orchard").unwrap();
+        let quote = quote(&mut st, "orchard", "orchard").unwrap();
         assert_eq!(quote.available_zatoshi, 10_000);
         assert_eq!(quote.fee_zatoshi, 10_000);
         assert_eq!(quote.max_zatoshi, 0);
     }
 
     #[test]
+    fn orchard_quote_max_is_zero_when_balance_is_below_the_fee() {
+        let mut st = test_state();
+        st.add_notes_checking_balance([[Zatoshis::const_from_u64(9_000)]]);
+        let quote = quote(&mut st, "orchard", "orchard").unwrap();
+        assert_eq!(quote.available_zatoshi, 9_000);
+        assert_eq!(quote.fee_zatoshi, 10_000);
+        assert_eq!(quote.max_zatoshi, 0);
+    }
+
+    #[test]
+    fn orchard_quote_reports_zero_max_for_an_empty_account() {
+        let mut st = test_state();
+        st.add_empty_blocks(10);
+        let quote = quote(&mut st, "orchard", "orchard").unwrap();
+        assert_eq!(quote.available_zatoshi, 0);
+        assert_eq!(quote.fee_zatoshi, 10_000);
+        assert_eq!(quote.max_zatoshi, 0);
+    }
+
+    // ZIP-317: max(⌈148/150⌉, 0) transparent + 2 Orchard actions (recipient,
+    // change) = 3 logical actions, above the 2-action grace → 3 × 5_000.
+    #[test]
     fn transparent_quote_reports_fee_and_max() {
         let mut st = test_state();
         fund_transparent(&mut st, 100_000_000);
-        let quote = quote(&mut st, "transparent").unwrap();
+        let quote = quote(&mut st, "transparent", "orchard").unwrap();
         assert_eq!(quote.available_zatoshi, 100_000_000);
-        assert!(quote.fee_zatoshi > 0);
-        assert_eq!(quote.max_zatoshi, 100_000_000 - quote.fee_zatoshi);
+        assert_eq!(quote.fee_zatoshi, 15_000);
+        assert_eq!(quote.max_zatoshi, 99_985_000);
+    }
+
+    // ZIP-317: max(⌈148/150⌉, ⌈34/34⌉) transparent + 1 Orchard change action
+    // = 2 logical actions, inside the 2-action grace → 2 × 5_000.
+    #[test]
+    fn transparent_quote_to_transparent_reports_fee_and_max() {
+        let mut st = test_state();
+        fund_transparent(&mut st, 100_000_000);
+        let quote = quote(&mut st, "transparent", "transparent").unwrap();
+        assert_eq!(quote.available_zatoshi, 100_000_000);
+        assert_eq!(quote.fee_zatoshi, 10_000);
+        assert_eq!(quote.max_zatoshi, 99_990_000);
     }
 
     #[test]
     fn transparent_quote_max_is_zero_when_balance_is_below_the_fee() {
         let mut st = test_state();
         fund_transparent(&mut st, 9_000);
-        let quote = quote(&mut st, "transparent").unwrap();
+        let quote = quote(&mut st, "transparent", "orchard").unwrap();
         assert_eq!(quote.available_zatoshi, 9_000);
-        assert!(quote.fee_zatoshi >= 9_000);
+        assert_eq!(quote.fee_zatoshi, 15_000);
         assert_eq!(quote.max_zatoshi, 0);
     }
 
@@ -803,9 +856,11 @@ mod tests {
     fn transparent_quote_reports_zero_max_for_dust() {
         let mut st = test_state();
         fund_transparent(&mut st, 5_000);
-        let quote = quote(&mut st, "transparent").unwrap();
+        let quote = quote(&mut st, "transparent", "orchard").unwrap();
         assert_eq!(quote.available_zatoshi, 0);
-        assert!(quote.fee_zatoshi > 0);
+        // No spendable input, so only the two Orchard actions pay: the
+        // 2-action grace floor still applies once an input exists.
+        assert_eq!(quote.fee_zatoshi, 10_000);
         assert_eq!(quote.max_zatoshi, 0);
     }
 }
