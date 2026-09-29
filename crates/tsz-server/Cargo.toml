@@ -15,7 +15,6 @@ clap.workspace = true
 hex.workspace = true
 futures-core = "0.3"
 futures-util = "0.3"
-rand.workspace = true
 rand10 = { package = "rand", version = "0.10" }
 reqwest.workspace = true
 rusqlite.workspace = true
