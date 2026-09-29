@@ -25,7 +25,7 @@ use zcash_protocol::consensus::COINBASE_MATURITY_BLOCKS;
 
 use crate::{
     db::{Account, Activity, Store, TREASURY_ACCOUNT_ID, USER_ACCOUNT_COUNT, ZATOSHIS_PER_ZEC},
-    rpc::{ChainInfo, NodeRpc},
+    rpc::{ChainInfo, NodeRpc, RpcError},
     wallet::{PaymentError, RealWallet, regtest_network},
 };
 
@@ -766,7 +766,14 @@ async fn seed(
     ))
 }
 async fn block(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
-    Ok(Json(state.0.rpc.block(&id).await?))
+    Ok(Json(
+        state
+            .0
+            .rpc
+            .block(&id)
+            .await
+            .map_err(|e| not_found(e, NO_BLOCK))?,
+    ))
 }
 #[derive(Deserialize)]
 struct BlocksQuery {
@@ -853,7 +860,12 @@ async fn transaction(
     State(state): State<AppState>,
     Path(txid): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    let mut tx = state.0.rpc.transaction(&txid).await?;
+    let mut tx = state
+        .0
+        .rpc
+        .transaction(&txid)
+        .await
+        .map_err(|e| not_found(e, NO_TRANSACTION))?;
     let mut prev_txs = std::collections::HashMap::new();
     for prev_id in transparent_prevout_ids(&tx) {
         if let Ok(prev) = state.0.rpc.transaction(&prev_id).await {
@@ -889,11 +901,35 @@ async fn search(
     if query.q.starts_with('t') {
         return address(State(state), Path(query.q)).await;
     }
-    if let Ok(block) = state.0.rpc.block(&query.q).await {
-        return Ok(Json(json!({"type":"block","value":block})));
+    // Only a 64-character hash can also be a txid; anything else is answered by the block lookup.
+    match state.0.rpc.block(&query.q).await {
+        Ok(block) => return Ok(Json(json!({"type":"block","value":block}))),
+        Err(error) if query.q.len() != 64 => return Err(not_found(error, NO_BLOCK)),
+        Err(_) => {}
     }
-    let tx = state.0.rpc.transaction(&query.q).await?;
+    let tx = state
+        .0
+        .rpc
+        .transaction(&query.q)
+        .await
+        .map_err(|e| not_found(e, NO_BLOCK_OR_TRANSACTION))?;
     Ok(Json(json!({"type":"transaction","value":tx})))
+}
+
+const NO_BLOCK: &str = "No block at that height or hash on this chain.";
+const NO_TRANSACTION: &str =
+    "No transaction with that ID on this chain. It may not have been mined yet.";
+const NO_BLOCK_OR_TRANSACTION: &str = "No block or transaction on this chain has that hash.";
+
+/// Zakura answers an unknown or unparseable block or transaction with -5 or -8.
+fn not_found(error: anyhow::Error, message: &str) -> ApiError {
+    match error.downcast_ref::<RpcError>().and_then(RpcError::code) {
+        Some(-5 | -8) => ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        },
+        _ => error.into(),
+    }
 }
 
 async fn events(
@@ -1379,6 +1415,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn explorer_reports_unknown_blocks_and_transactions_as_404() {
+        // A node that knows nothing, answering with Zakura's not-found codes.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node = format!("http://{}", listener.local_addr().unwrap());
+        let not_found = Router::new().route(
+            "/",
+            post(|Json(req): Json<Value>| async move {
+                let code = if req["method"] == "getblock" { -8 } else { -5 };
+                Json(json!({"error": {"code": code, "message": "not found"}}))
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, not_found).await });
+
+        let (state, _dir) = state_with_local_wallet();
+        let state = AppState::new(
+            state.0.store.clone(),
+            state.0.wallet.clone(),
+            node,
+            "test".into(),
+        );
+        let hash = "a".repeat(64);
+        for path in [
+            "/api/v1/blocks/999999".to_owned(),
+            format!("/api/v1/transactions/{hash}"),
+            "/api/v1/search?q=999999".to_owned(),
+            format!("/api/v1/search?q={hash}"),
+        ] {
+            let response = router(state.clone())
+                .oneshot(Request::get(&path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
     }
 
     #[test]

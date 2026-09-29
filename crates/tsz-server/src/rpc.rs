@@ -28,6 +28,19 @@ pub struct ChainInfo {
     pub verificationprogress: f64,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("Zakura {method} failed: {error}")]
+pub struct RpcError {
+    method: String,
+    error: Value,
+}
+
+impl RpcError {
+    pub fn code(&self) -> Option<i64> {
+        self.error.get("code").and_then(Value::as_i64)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct Envelope<T> {
     result: Option<T>,
@@ -72,7 +85,8 @@ impl NodeRpc {
         let status = response.status();
         let envelope: Envelope<T> = response.json().await.context("decoding Zakura response")?;
         if let Some(error) = envelope.error {
-            bail!("Zakura {method} failed: {error}");
+            let method = method.to_owned();
+            return Err(RpcError { method, error }.into());
         }
         if !status.is_success() {
             bail!("Zakura {method} returned HTTP {status}");
