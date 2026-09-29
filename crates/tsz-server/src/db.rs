@@ -13,7 +13,7 @@ use zcash_keys::{
     address::Address,
     keys::{Era, UnifiedAddressRequest, UnifiedFullViewingKey, UnifiedSpendingKey},
 };
-use zcash_protocol::{consensus::BlockHeight, local_consensus::LocalNetwork};
+use zcash_protocol::local_consensus::LocalNetwork;
 
 pub const ZATOSHIS_PER_ZEC: u64 = 100_000_000;
 pub const USER_ACCOUNT_COUNT: u8 = 5;
@@ -29,6 +29,8 @@ pub struct Account {
     pub unified_full_viewing_key: Option<String>,
     pub transparent_zatoshi: u64,
     pub orchard_zatoshi: u64,
+    /// Read from the wallet snapshot only; the accounts table has no column for it.
+    pub ironwood_zatoshi: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,7 +255,7 @@ impl Store {
             bail!("account {to} does not exist");
         }
         let tx = db.transaction()?;
-        let mut activity = new_activity("faucet", None, to, "orchard", pool, amount);
+        let mut activity = new_activity("faucet", None, to, "ironwood", pool, amount);
         activity.txid = txid.to_owned();
         insert_activity(&tx, &activity, key)?;
         tx.commit()?;
@@ -343,10 +345,10 @@ fn new_activity(
     }
 }
 fn validate_pool(pool: &str) -> Result<()> {
-    if matches!(pool, "transparent" | "orchard") {
+    if matches!(pool, "transparent" | "ironwood") {
         Ok(())
     } else {
-        bail!("pool must be transparent or orchard")
+        bail!("pool must be transparent or ironwood")
     }
 }
 fn row_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
@@ -358,6 +360,7 @@ fn row_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
         unified_full_viewing_key: None,
         transparent_zatoshi: row.get(4)?,
         orchard_zatoshi: row.get(5)?,
+        ironwood_zatoshi: 0,
     })
 }
 fn row_activity(row: &rusqlite::Row<'_>) -> rusqlite::Result<Activity> {
@@ -400,19 +403,7 @@ fn derived_addresses(seed: &[u8], id: u8) -> Result<(String, String)> {
 }
 
 fn local_network() -> LocalNetwork {
-    let one = Some(BlockHeight::from_u32(1));
-    LocalNetwork {
-        overwinter: one,
-        sapling: one,
-        blossom: one,
-        heartwood: one,
-        canopy: one,
-        nu5: one,
-        nu6: one,
-        nu6_1: None,
-        nu6_2: None,
-        nu6_3: None,
-    }
+    crate::wallet::regtest_network()
 }
 
 #[cfg(test)]
@@ -436,10 +427,10 @@ mod tests {
                 .starts_with("tm")
         );
         let first = store
-            .faucet(2, "orchard", ZATOSHIS_PER_ZEC, "same", "txid")
+            .faucet(2, "ironwood", ZATOSHIS_PER_ZEC, "same", "txid")
             .unwrap();
         let second = store
-            .faucet(2, "orchard", ZATOSHIS_PER_ZEC, "same", "ignored")
+            .faucet(2, "ironwood", ZATOSHIS_PER_ZEC, "same", "ignored")
             .unwrap();
         assert_eq!(first.id, second.id);
         assert_eq!(store.account(2).unwrap().orchard_zatoshi, 0);
@@ -597,7 +588,7 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let activity = store
-            .transfer(1, 2, "orchard", "orchard", 12_000, "send", "real-txid")
+            .transfer(1, 2, "ironwood", "ironwood", 12_000, "send", "real-txid")
             .unwrap();
         assert_eq!(activity.txid, "real-txid");
         assert_eq!(store.account(1).unwrap().transparent_zatoshi, 0);
@@ -611,8 +602,8 @@ mod tests {
             .transfer(
                 1,
                 2,
-                "orchard",
-                "orchard",
+                "ironwood",
+                "ironwood",
                 12_000,
                 "pending-key",
                 "txid-pending",
@@ -622,8 +613,8 @@ mod tests {
             .transfer(
                 1,
                 3,
-                "orchard",
-                "orchard",
+                "ironwood",
+                "ironwood",
                 13_000,
                 "mined-key",
                 "txid-mined",
@@ -646,8 +637,8 @@ mod tests {
             .transfer(
                 1,
                 2,
-                "orchard",
-                "orchard",
+                "ironwood",
+                "ironwood",
                 12_000,
                 "empty-hash",
                 "txid-empty",
@@ -655,7 +646,15 @@ mod tests {
             .unwrap();
         assert!(store.confirm(&pending.id, "").is_err());
         let again = store
-            .transfer(1, 2, "orchard", "orchard", 12_000, "empty-hash", "ignored")
+            .transfer(
+                1,
+                2,
+                "ironwood",
+                "ironwood",
+                12_000,
+                "empty-hash",
+                "ignored",
+            )
             .unwrap();
         assert_eq!(again.id, pending.id);
         assert_eq!(again.status, "broadcast");

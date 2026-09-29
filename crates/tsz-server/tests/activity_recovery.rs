@@ -163,8 +163,8 @@ async fn exercise_recovery(
         Some(&json!({
             "from_account": 1,
             "to_account": 2,
-            "source_pool": "orchard",
-            "destination_pool": "orchard",
+            "source_pool": "ironwood",
+            "destination_pool": "ironwood",
             "amount_zatoshi": 1000000,
             "idempotency_key": RECOVERY_IDEMPOTENCY_KEY,
         })),
@@ -347,11 +347,11 @@ fn assert_requested_payment_fields(activity: &Activity) -> Result<()> {
         "activity destination account changed"
     );
     anyhow::ensure!(
-        activity.source_pool == "orchard",
+        activity.source_pool == "ironwood",
         "activity source pool changed"
     );
     anyhow::ensure!(
-        activity.destination_pool == "orchard",
+        activity.destination_pool == "ironwood",
         "activity destination pool changed"
     );
     anyhow::ensure!(
@@ -495,8 +495,8 @@ mod tests {
             kind: "send".to_owned(),
             from_account: Some(1),
             to_account: 2,
-            source_pool: "orchard".to_owned(),
-            destination_pool: "orchard".to_owned(),
+            source_pool: "ironwood".to_owned(),
+            destination_pool: "ironwood".to_owned(),
             amount_zatoshi: 1_000_000,
             txid: "b".repeat(64),
             block_hash: None,

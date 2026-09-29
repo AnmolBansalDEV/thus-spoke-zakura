@@ -57,7 +57,7 @@ pub enum PaymentError {
     InsufficientFunds { available: u64, required: u64 },
     #[error("faucet treasury remains insufficient after replenishment")]
     TreasuryExhausted,
-    #[error("memos can only be sent to the orchard pool; transparent outputs cannot carry a memo")]
+    #[error("memos can only be sent to the ironwood pool; transparent outputs cannot carry a memo")]
     TransparentMemo,
 }
 
@@ -144,6 +144,9 @@ impl BlockCache for MemoryBlockCache {
     }
 }
 
+/// Every upgrade through NU6.3 activates at height 1, so the Orchard pool never
+/// accepts deposits on this chain and all new shielded value lives in Ironwood.
+/// Keep these heights in sync with the Zakura configuration in `main.rs`.
 pub fn regtest_network() -> LocalNetwork {
     let one = Some(BlockHeight::from_u32(1));
     LocalNetwork {
@@ -154,9 +157,9 @@ pub fn regtest_network() -> LocalNetwork {
         canopy: one,
         nu5: one,
         nu6: one,
-        nu6_1: None,
-        nu6_2: None,
-        nu6_3: None,
+        nu6_1: one,
+        nu6_2: one,
+        nu6_3: one,
     }
 }
 
@@ -276,6 +279,7 @@ impl RealWallet {
             if let Some(balance) = summary.account_balances().get(wallet_id) {
                 account.transparent_zatoshi = u64::from(balance.unshielded_balance().total());
                 account.orchard_zatoshi = u64::from(balance.orchard_balance().total());
+                account.ironwood_zatoshi = u64::from(balance.ironwood_balance().total());
             }
         }
         Ok(())
@@ -329,7 +333,7 @@ impl RealWallet {
             let change = SingleOutputChangeStrategy::<Db>::new(
                 StandardFeeRule::Zip317,
                 None,
-                ShieldedPool::Orchard,
+                ShieldedPool::Ironwood,
                 DustOutputPolicy::default(),
             );
             let policy = SpendPolicy::shielded_pools([])
@@ -346,7 +350,9 @@ impl RealWallet {
                 None,
                 None,
             )
-        } else if source_pool == "orchard" {
+        } else if source_pool == "ironwood" {
+            // Once NU6.3 is active the SDK builds a unified-address payment's
+            // Orchard receiver as an Ironwood output, and routes change there too.
             propose_standard_transfer_to_address::<_, _, Infallible>(
                 &mut *db,
                 &params,
@@ -357,12 +363,12 @@ impl RealWallet {
                 amount,
                 memo,
                 None,
-                ShieldedPool::Orchard,
+                ShieldedPool::Ironwood,
                 None,
                 None,
             )
         } else {
-            bail!("source pool must be transparent or orchard")
+            bail!("source pool must be transparent or ironwood")
         }
         .map_err(|error| match error {
             WalletError::InsufficientFunds {

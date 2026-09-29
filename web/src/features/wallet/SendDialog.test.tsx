@@ -30,8 +30,8 @@ function mockSend() {
           kind: 'send',
           from_account: 1,
           to_account: 2,
-          source_pool: 'orchard',
-          destination_pool: 'orchard',
+          source_pool: 'ironwood',
+          destination_pool: 'ironwood',
           amount_zatoshi: requestBody(init).amount_zatoshi,
           txid: 'f'.repeat(64),
           block_hash: null,
@@ -129,14 +129,14 @@ describe('SendDialog', () => {
     renderWithProviders(<SendDialog open onOpenChange={vi.fn()} accounts={testAccounts} />);
     const memo = screen.getByLabelText('Memo (optional)');
     expect(memo).toBeEnabled();
-    await userEvent.type(memo, 'orchard only');
+    await userEvent.type(memo, 'ironwood only');
 
     await userEvent.click(screen.getByLabelText('Destination pool'));
     await userEvent.click(await screen.findByRole('option', { name: 'Transparent (public)' }));
 
     expect(memo).toBeDisabled();
     expect(memo).toHaveValue('');
-    expect(screen.getByText(/only available for orchard destinations/i)).toBeInTheDocument();
+    expect(screen.getByText(/only available for ironwood destinations/i)).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());
@@ -191,7 +191,7 @@ describe('SendDialog', () => {
     await userEvent.type(field, '1');
     await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
 
-    expect(await screen.findByText(/holds 0 ZEC in the orchard pool/i)).toBeInTheDocument();
+    expect(await screen.findByText(/holds 0 ZEC in the ironwood pool/i)).toBeInTheDocument();
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -199,6 +199,6 @@ describe('SendDialog', () => {
     renderWithProviders(
       <SendDialog open onOpenChange={vi.fn()} accounts={testAccounts} defaultAccountId={1} />,
     );
-    expect(screen.getByText(/5 ZEC available in the orchard pool/i)).toBeInTheDocument();
+    expect(screen.getByText(/5 ZEC available in the ironwood pool/i)).toBeInTheDocument();
   });
 });

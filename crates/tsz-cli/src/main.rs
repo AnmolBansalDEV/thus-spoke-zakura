@@ -111,12 +111,12 @@ enum WalletCommand {
         #[arg(long, default_value = "1")]
         amount: ZecAmount,
         /// Pool to fund.
-        #[arg(long, value_enum, default_value = "orchard")]
+        #[arg(long, value_enum, default_value = "ironwood")]
         pool: Pool,
     },
     /// Send funds from one development account (1-5) to another.
     Send(SendArgs),
-    /// Spend one account's transparent funds into another account's orchard balance.
+    /// Spend one account's transparent funds into another account's ironwood balance.
     Shield {
         /// Account index to shield from (1-5).
         #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
@@ -131,7 +131,7 @@ enum WalletCommand {
         #[arg(long, value_parser = parse_memo)]
         memo: Option<String>,
     },
-    /// Spend one account's orchard funds into another account's transparent balance.
+    /// Spend one account's ironwood funds into another account's transparent balance.
     Unshield {
         /// Account index to unshield from (1-5).
         #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
@@ -157,12 +157,12 @@ struct SendArgs {
     #[arg(long)]
     amount: SendAmount,
     /// Pool to spend from.
-    #[arg(long = "source-pool", value_enum, default_value = "orchard")]
+    #[arg(long = "source-pool", value_enum, default_value = "ironwood")]
     source_pool: Pool,
     /// Pool the destination account receives into.
-    #[arg(long = "destination-pool", value_enum, default_value = "orchard")]
+    #[arg(long = "destination-pool", value_enum, default_value = "ironwood")]
     destination_pool: Pool,
-    /// Text memo for the recipient (up to 512 bytes; orchard destinations only).
+    /// Text memo for the recipient (up to 512 bytes; ironwood destinations only).
     #[arg(long, value_parser = parse_memo)]
     memo: Option<String>,
 }
@@ -170,14 +170,14 @@ struct SendArgs {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 #[value(rename_all = "lower")]
 enum Pool {
-    Orchard,
+    Ironwood,
     Transparent,
 }
 
 impl Pool {
     fn as_str(self) -> &'static str {
         match self {
-            Pool::Orchard => "orchard",
+            Pool::Ironwood => "ironwood",
             Pool::Transparent => "transparent",
         }
     }
@@ -236,7 +236,7 @@ fn main() -> Result<ExitCode> {
                     to,
                     amount,
                     source_pool: Pool::Transparent,
-                    destination_pool: Pool::Orchard,
+                    destination_pool: Pool::Ironwood,
                     memo,
                 },
                 cli.json,
@@ -248,7 +248,7 @@ fn main() -> Result<ExitCode> {
                     from,
                     to,
                     amount,
-                    source_pool: Pool::Orchard,
+                    source_pool: Pool::Ironwood,
                     destination_pool: Pool::Transparent,
                     memo: None,
                 },
@@ -270,7 +270,7 @@ fn check_send(args: &SendArgs) -> Result<()> {
     }
     if args.memo.is_some() && args.destination_pool == Pool::Transparent {
         bail!(
-            "--memo requires --destination-pool orchard; transparent outputs cannot carry a memo"
+            "--memo requires --destination-pool ironwood; transparent outputs cannot carry a memo"
         );
     }
     Ok(())
@@ -488,7 +488,7 @@ mod tests {
         assert_eq!((args.from, args.to), (1, 2));
         assert_eq!(args.amount.zatoshi(), 150_000_000);
         assert_eq!(args.source_pool, Pool::Transparent);
-        assert_eq!(args.destination_pool, Pool::Orchard);
+        assert_eq!(args.destination_pool, Pool::Ironwood);
         assert_eq!(args.memo.as_deref(), Some("hello"));
 
         assert!(
@@ -549,7 +549,7 @@ mod tests {
             from,
             to,
             amount: SendAmount(1),
-            source_pool: Pool::Orchard,
+            source_pool: Pool::Ironwood,
             destination_pool,
             memo: memo.map(str::to_owned),
         }
@@ -568,9 +568,9 @@ mod tests {
 
     #[test]
     fn sends_are_checked_before_contacting_the_environment() {
-        assert!(check_send(&send_args(1, 2, Pool::Orchard, Some(""))).is_ok());
+        assert!(check_send(&send_args(1, 2, Pool::Ironwood, Some(""))).is_ok());
         assert!(check_send(&send_args(1, 2, Pool::Transparent, None)).is_ok());
-        assert!(check_send(&send_args(3, 3, Pool::Orchard, None)).is_err());
+        assert!(check_send(&send_args(3, 3, Pool::Ironwood, None)).is_err());
         assert!(check_send(&send_args(1, 2, Pool::Transparent, Some("hi"))).is_err());
         assert!(check_send(&send_args(1, 2, Pool::Transparent, Some(""))).is_err());
     }

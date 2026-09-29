@@ -45,14 +45,17 @@ describe('accountSchema', () => {
     const account = accountSchema.parse({
       ...legacyAccount,
       unified_full_viewing_key: 'opaque-viewing-key-for-schema-test',
+      ironwood_zatoshi: 789,
     });
     expect(account.unified_full_viewing_key).toBe('opaque-viewing-key-for-schema-test');
     expect(account.orchard_zatoshi).toBe(456n);
+    expect(account.ironwood_zatoshi).toBe(789n);
   });
 
   it('accepts packaged 0.2.1 accounts without a viewing key', () => {
     const account = accountSchema.parse(legacyAccount);
     expect(account.unified_full_viewing_key).toBeUndefined();
     expect(account.transparent_zatoshi).toBe(123n);
+    expect(account.ironwood_zatoshi).toBe(0n);
   });
 });

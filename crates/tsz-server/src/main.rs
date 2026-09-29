@@ -93,13 +93,27 @@ fn development_credentials(store: &Store) -> Result<String> {
     Ok(output.trim_end().to_owned())
 }
 
+/// A zero-value payment to the P2SH address of an all-zero script hash. Every
+/// chain that activates NU6.1 must carry the one-time ZIP-271 lockbox
+/// disbursement in its activation-block coinbase, and Regtest configures none,
+/// so Zakura rejects that block. This marker satisfies the rule without
+/// creating funds or drawing on the empty local lockbox; Zakura's own local
+/// network generator uses the same marker.
+const LOCKBOX_MARKER_ADDRESS: &str = "t26YoyZ1iPgiMEWL4zGUm74eVWfhyDMXzY2";
+
 fn zakura_config(miner: &str) -> String {
+    // Keep these heights in sync with `wallet::regtest_network()`.
     format!(
         r#"[network]
 network = "Regtest"
 listen_addr = "0.0.0.0:18233"
+[network.testnet_parameters]
+lockbox_disbursements = [{{ address = "{LOCKBOX_MARKER_ADDRESS}", amount = 0 }}]
 [network.testnet_parameters.activation_heights]
 "NU6" = 1
+"NU6.1" = 1
+"NU6.2" = 1
+"NU6.3" = 1
 
 [rpc]
 listen_addr = "0.0.0.0:18232"
@@ -139,7 +153,7 @@ async fn serve(data_dir: PathBuf) -> Result<()> {
     }
     api::provision_initial_balance(&state)
         .await
-        .context("provisioning Account 1 with 5 Orchard ZEC")?;
+        .context("provisioning Account 1 with 5 Ironwood ZEC")?;
     tokio::spawn(api::wallet_sync_loop(state.clone()));
     let app = api::router(state);
     let address: SocketAddr = std::env::var("TSZ_LISTEN")
@@ -168,6 +182,25 @@ mod tests {
         let config = zakura_config(&treasury);
         assert!(config.contains(&format!("miner_address = \"{treasury}\"")));
         assert!(!config.contains(&format!("miner_address = \"{user}\"")));
+    }
+
+    #[test]
+    fn activates_ironwood_with_a_lockbox_marker() {
+        let config = zakura_config("tm-miner");
+        for upgrade in ["NU6", "NU6.1", "NU6.2", "NU6.3"] {
+            assert!(config.contains(&format!("\"{upgrade}\" = 1\n")));
+        }
+        assert!(config.contains(&format!(
+            "lockbox_disbursements = [{{ address = \"{LOCKBOX_MARKER_ADDRESS}\", amount = 0 }}]"
+        )));
+        let network = wallet::regtest_network();
+        assert!(matches!(
+            zcash_keys::address::Address::decode(&network, LOCKBOX_MARKER_ADDRESS),
+            Some(zcash_keys::address::Address::Transparent(_))
+        ));
+        assert_eq!(network.nu6_1, network.nu6);
+        assert_eq!(network.nu6_2, network.nu6);
+        assert_eq!(network.nu6_3, network.nu6);
     }
 
     #[test]

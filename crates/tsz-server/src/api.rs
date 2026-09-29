@@ -376,7 +376,7 @@ async fn send(
     }
     state.synchronize_latest().await?;
     let destination = state.0.store.account(req.to_account)?;
-    let address = if req.destination_pool == "orchard" {
+    let address = if req.destination_pool == "ironwood" {
         destination.unified_address
     } else {
         destination.transparent_address
@@ -426,9 +426,7 @@ async fn faucet(
     if req.amount_zatoshi == 0 {
         return Err(ApiError::bad_request("amount must be greater than zero"));
     }
-    if !matches!(req.pool.as_str(), "transparent" | "orchard") {
-        return Err(ApiError::bad_request("pool must be transparent or orchard"));
-    }
+    require_pool(&req.pool, "pool")?;
     Ok(Json(
         fund_from_treasury(
             &state,
@@ -496,8 +494,8 @@ async fn fund_from_treasury(
     let destination = state.0.store.account(account_id)?;
     let address = match pool {
         "transparent" => destination.transparent_address,
-        "orchard" => destination.unified_address,
-        _ => anyhow::bail!("pool must be transparent or orchard"),
+        "ironwood" => destination.unified_address,
+        _ => anyhow::bail!("pool must be transparent or ironwood"),
     };
     state.synchronize_latest().await?;
     let seed = state.0.store.seed()?;
@@ -547,7 +545,7 @@ impl FaucetRuntime for AppState {
             .send(
                 seed,
                 TREASURY_ACCOUNT_ID,
-                "orchard",
+                "ironwood",
                 destination,
                 amount_zatoshi,
                 None,
@@ -695,7 +693,7 @@ async fn mine_and_sync(state: &AppState, blocks: u32) -> anyhow::Result<Vec<Stri
 }
 
 pub async fn provision_initial_balance(state: &AppState) -> anyhow::Result<()> {
-    const INITIAL_FUNDING_KEY: &str = "startup-account-1-orchard-v1";
+    const INITIAL_FUNDING_KEY: &str = "startup-account-1-ironwood-v1";
     if let Some(existing) = state.0.store.activity_for_key(INITIAL_FUNDING_KEY)?
         && existing.status == "confirmed"
     {
@@ -715,7 +713,7 @@ pub async fn provision_initial_balance(state: &AppState) -> anyhow::Result<()> {
     fund_from_treasury(
         state,
         1,
-        "orchard",
+        "ironwood",
         5 * ZATOSHIS_PER_ZEC,
         INITIAL_FUNDING_KEY,
     )
@@ -727,9 +725,9 @@ pub async fn provision_initial_balance(state: &AppState) -> anyhow::Result<()> {
         .find(|account| account.id == 1)
         .context("Account 1 disappeared during startup provisioning")?;
     anyhow::ensure!(
-        account.orchard_zatoshi == 5 * ZATOSHIS_PER_ZEC,
-        "Account 1 startup Orchard balance is {}, expected {} zatoshi; reset this existing instance to migrate to the hidden treasury",
-        account.orchard_zatoshi,
+        account.ironwood_zatoshi == 5 * ZATOSHIS_PER_ZEC,
+        "Account 1 startup Ironwood balance is {}, expected {} zatoshi",
+        account.ironwood_zatoshi,
         5 * ZATOSHIS_PER_ZEC
     );
     Ok(())
@@ -986,12 +984,16 @@ fn require_key(key: &str) -> ApiResult<()> {
 }
 
 fn require_pool(pool: &str, field: &str) -> ApiResult<()> {
-    if matches!(pool, "transparent" | "orchard") {
-        Ok(())
-    } else {
-        Err(ApiError::bad_request(format!(
-            "{field} must be transparent or orchard"
-        )))
+    match pool {
+        "transparent" | "ironwood" => Ok(()),
+        // NU6.3 is active from block 1, so the Orchard pool can neither receive
+        // nor hold funds on this chain.
+        "orchard" => Err(ApiError::bad_request(format!(
+            "{field} orchard is unavailable: NU6.3 is active and Orchard no longer accepts deposits; use ironwood"
+        ))),
+        _ => Err(ApiError::bad_request(format!(
+            "{field} must be transparent or ironwood"
+        ))),
     }
 }
 
@@ -1017,12 +1019,12 @@ fn validate_send(req: &SendRequest) -> ApiResult<Option<MemoBytes>> {
 }
 
 /// An absent (or null) memo is `None`. Any present memo, including `""`, is
-/// encoded as an explicit ZIP-302 text memo and is only valid for orchard.
+/// encoded as an explicit ZIP-302 text memo and is only valid for ironwood.
 fn parse_memo(memo: Option<&str>, destination_pool: &str) -> ApiResult<Option<MemoBytes>> {
     let Some(text) = memo else {
         return Ok(None);
     };
-    if destination_pool != "orchard" {
+    if destination_pool != "ironwood" {
         return Err(anyhow::Error::new(PaymentError::TransparentMemo).into());
     }
     // Text memos are zero-padded to 512 bytes, so a trailing NUL could not be
@@ -1234,7 +1236,7 @@ mod tests {
         let (state, _dir) = state_with_local_wallet();
         {
             let mut snapshot = state.0.wallet_snapshot.write().await;
-            snapshot.accounts[0].orchard_zatoshi = 400_000_000;
+            snapshot.accounts[0].ironwood_zatoshi = 400_000_000;
         }
         let response = router(state)
             .oneshot(
@@ -1257,7 +1259,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1, 2, 3, 4, 5],
         );
-        assert_eq!(accounts[0]["orchard_zatoshi"], 400_000_000);
+        assert_eq!(accounts[0]["ironwood_zatoshi"], 400_000_000);
         let expected_keys = std::collections::BTreeSet::from([
             "id",
             "name",
@@ -1265,6 +1267,7 @@ mod tests {
             "transparent_address",
             "transparent_zatoshi",
             "orchard_zatoshi",
+            "ironwood_zatoshi",
             "unified_full_viewing_key",
         ]);
         for account in accounts {
@@ -1288,14 +1291,14 @@ mod tests {
         let (state, _dir) = state_with_local_wallet();
         {
             let mut snapshot = state.0.wallet_snapshot.write().await;
-            snapshot.accounts[0].orchard_zatoshi = 400_000_000;
+            snapshot.accounts[0].ironwood_zatoshi = 400_000_000;
             snapshot.status.last_success_at = Some(123);
         }
 
         assert!(state.synchronize_wallet(Some(1)).await.is_err());
 
         let snapshot = state.0.wallet_snapshot.read().await;
-        assert_eq!(snapshot.accounts[0].orchard_zatoshi, 400_000_000);
+        assert_eq!(snapshot.accounts[0].ironwood_zatoshi, 400_000_000);
         assert_eq!(snapshot.status.last_success_at, Some(123));
         assert_eq!(snapshot.status.state, "error");
         assert!(snapshot.status.error.is_some());
@@ -1376,7 +1379,7 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let pending = store
-            .transfer(1, 2, "orchard", "orchard", 12_000, "issue-67", "txid-abc")
+            .transfer(1, 2, "ironwood", "ironwood", 12_000, "issue-67", "txid-abc")
             .unwrap();
         assert_eq!(pending.status, "broadcast");
 
@@ -1415,11 +1418,23 @@ mod tests {
     }
 
     #[test]
+    fn rejects_orchard_as_a_pool_after_nu6_3() {
+        assert!(require_pool("ironwood", "pool").is_ok());
+        assert!(require_pool("transparent", "pool").is_ok());
+        let Err(error) = require_pool("orchard", "destination_pool") else {
+            panic!("orchard must be rejected");
+        };
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("use ironwood"));
+        assert!(is_bad_request(require_pool("sapling", "pool")));
+    }
+
+    #[test]
     fn absent_and_null_memos_differ_from_an_explicit_empty_memo() {
         let request = |memo: Option<Value>| {
             let mut body = json!({
-                "from_account": 1, "to_account": 2, "source_pool": "orchard",
-                "destination_pool": "orchard", "amount_zatoshi": 1,
+                "from_account": 1, "to_account": 2, "source_pool": "ironwood",
+                "destination_pool": "ironwood", "amount_zatoshi": 1,
                 "idempotency_key": "memo-test-key",
             });
             if let Some(memo) = memo {
@@ -1431,9 +1446,9 @@ mod tests {
         assert_eq!(request(Some(Value::Null)).memo, None);
         assert_eq!(request(Some(json!(""))).memo.as_deref(), Some(""));
 
-        assert!(matches!(parse_memo(None, "orchard"), Ok(None)));
+        assert!(matches!(parse_memo(None, "ironwood"), Ok(None)));
         assert!(matches!(parse_memo(None, "transparent"), Ok(None)));
-        let Ok(Some(empty)) = parse_memo(Some(""), "orchard") else {
+        let Ok(Some(empty)) = parse_memo(Some(""), "ironwood") else {
             panic!("an explicit empty memo must be kept");
         };
         assert_eq!(empty.as_array(), &[0u8; 512]);
@@ -1447,41 +1462,41 @@ mod tests {
 
     #[test]
     fn memos_are_bounded_by_utf8_bytes() {
-        let Ok(Some(memo)) = parse_memo(Some("thanks for lunch"), "orchard") else {
+        let Ok(Some(memo)) = parse_memo(Some("thanks for lunch"), "ironwood") else {
             panic!("expected an encoded memo");
         };
         assert_eq!(&memo.as_slice()[..16], b"thanks for lunch");
         assert!(memo.as_slice()[16..].iter().all(|byte| *byte == 0));
 
-        assert!(parse_memo(Some(&"a".repeat(512)), "orchard").is_ok());
+        assert!(parse_memo(Some(&"a".repeat(512)), "ironwood").is_ok());
         assert!(is_bad_request(parse_memo(
             Some(&"a".repeat(513)),
-            "orchard"
+            "ironwood"
         )));
 
         // Three bytes per character: 170 fit (510 bytes), 171 do not (513).
-        let Ok(Some(cjk)) = parse_memo(Some(&"桜".repeat(170)), "orchard") else {
+        let Ok(Some(cjk)) = parse_memo(Some(&"桜".repeat(170)), "ironwood") else {
             panic!("510 bytes of multibyte text must fit");
         };
         assert_eq!(&cjk.as_slice()[..510], "桜".repeat(170).as_bytes());
         assert!(is_bad_request(parse_memo(
             Some(&"桜".repeat(171)),
-            "orchard"
+            "ironwood"
         )));
 
         // Four bytes per character: exactly 512 fits, one more does not.
-        assert!(parse_memo(Some(&"🌸".repeat(128)), "orchard").is_ok());
+        assert!(parse_memo(Some(&"🌸".repeat(128)), "ironwood").is_ok());
         assert!(is_bad_request(parse_memo(
             Some(&"🌸".repeat(129)),
-            "orchard"
+            "ironwood"
         )));
     }
 
     #[test]
     fn memos_must_not_end_with_nul() {
-        assert!(is_bad_request(parse_memo(Some("hi\0"), "orchard")));
-        assert!(is_bad_request(parse_memo(Some("\0"), "orchard")));
-        assert!(parse_memo(Some("a\0b"), "orchard").is_ok());
+        assert!(is_bad_request(parse_memo(Some("hi\0"), "ironwood")));
+        assert!(is_bad_request(parse_memo(Some("\0"), "ironwood")));
+        assert!(parse_memo(Some("a\0b"), "ironwood").is_ok());
     }
 
     const REPLAY_KEY: &str = "existing-idempotency-key";
@@ -1502,8 +1517,8 @@ mod tests {
         json!({
             "from_account": 1,
             "to_account": 2,
-            "source_pool": "orchard",
-            "destination_pool": "orchard",
+            "source_pool": "ironwood",
+            "destination_pool": "ironwood",
             "amount_zatoshi": 100_000,
             "idempotency_key": REPLAY_KEY,
         })
@@ -1546,7 +1561,7 @@ mod tests {
         let original = state
             .0
             .store
-            .transfer(1, 2, "orchard", "orchard", 100_000, REPLAY_KEY, "txid")
+            .transfer(1, 2, "ironwood", "ironwood", 100_000, REPLAY_KEY, "txid")
             .unwrap();
         let before = activity_ids(&state);
 
@@ -1617,7 +1632,7 @@ mod tests {
         let original = state
             .0
             .store
-            .transfer(1, 2, "orchard", "orchard", 100_000, REPLAY_KEY, "txid")
+            .transfer(1, 2, "ironwood", "ironwood", 100_000, REPLAY_KEY, "txid")
             .unwrap();
         let before = activity_ids(&state);
 
@@ -1763,6 +1778,7 @@ mod tests {
             unified_full_viewing_key: None,
             transparent_zatoshi: 0,
             orchard_zatoshi: 0,
+            ironwood_zatoshi: 0,
         };
 
         let txid = send_with_replenishment(

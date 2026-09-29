@@ -32,7 +32,7 @@ export function FaucetDialog({
     // Defaults to 1 ZEC rather than the 5 ZEC ceiling: the treasury is funded
     // from block rewards, and requests at the maximum are the first to fail
     // once the subsidy has halved.
-    defaultValues: { account_id: String(defaultAccountId ?? 1), pool: 'orchard', amount: '1' },
+    defaultValues: { account_id: String(defaultAccountId ?? 1), pool: 'ironwood', amount: '1' },
   });
 
   const submit = form.handleSubmit((values) => {

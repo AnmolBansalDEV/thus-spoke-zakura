@@ -16,7 +16,7 @@ const zatoshi = z
   .nonnegative()
   .transform((value) => BigInt(value));
 
-export const poolSchema = z.enum(['transparent', 'orchard']);
+export const poolSchema = z.enum(['transparent', 'ironwood']);
 export type Pool = z.infer<typeof poolSchema>;
 
 export const accountSchema = z.object({
@@ -27,6 +27,8 @@ export const accountSchema = z.object({
   unified_full_viewing_key: z.string().optional(),
   transparent_zatoshi: zatoshi,
   orchard_zatoshi: zatoshi,
+  // Servers from before NU6.3 activation report no Ironwood balance.
+  ironwood_zatoshi: zatoshi.default(0n),
 });
 export type Account = z.infer<typeof accountSchema>;
 
