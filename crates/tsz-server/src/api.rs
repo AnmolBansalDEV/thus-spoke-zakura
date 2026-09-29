@@ -18,15 +18,18 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::{
+    sync::{Mutex, RwLock, broadcast},
+    time::Instant,
+};
 use tower_http::{services::ServeDir, trace::TraceLayer};
-use zcash_keys::address::Address;
+use zcash_keys::{address::Address, encoding::AddressCodec};
 use zcash_protocol::{consensus::COINBASE_MATURITY_BLOCKS, memo::MemoBytes, value::MAX_MONEY};
 
 use crate::{
     db::{Account, Activity, Store, TREASURY_ACCOUNT_ID, USER_ACCOUNT_COUNT, ZATOSHIS_PER_ZEC},
-    rpc::{ChainInfo, NodeRpc},
-    wallet::{PaymentError, RealWallet, regtest_network},
+    rpc::{ChainCheckpoint, ChainInfo, NodeRpc},
+    wallet::{PaymentError, RealWallet, WALLET_BIRTHDAY_HEIGHT, regtest_network},
 };
 
 #[derive(Clone)]
@@ -38,6 +41,7 @@ struct Inner {
     instance: String,
     events: broadcast::Sender<String>,
     wallet_sync: Mutex<()>,
+    treasury_replenishment: Mutex<()>,
     wallet_snapshot: RwLock<WalletSnapshot>,
 }
 
@@ -51,7 +55,9 @@ struct WalletSnapshot {
 struct WalletSyncStatus {
     state: &'static str,
     fully_scanned_height: Option<u64>,
+    fully_scanned_hash: Option<String>,
     observed_height: Option<u64>,
+    observed_hash: Option<String>,
     last_success_at: Option<u64>,
     error: Option<String>,
 }
@@ -67,12 +73,15 @@ impl AppState {
             instance,
             events,
             wallet_sync: Mutex::new(()),
+            treasury_replenishment: Mutex::new(()),
             wallet_snapshot: RwLock::new(WalletSnapshot {
                 accounts,
                 status: WalletSyncStatus {
                     state: "syncing",
                     fully_scanned_height: None,
+                    fully_scanned_hash: None,
                     observed_height: None,
+                    observed_hash: None,
                     last_success_at: None,
                     error: None,
                 },
@@ -89,19 +98,8 @@ impl AppState {
     }
 
     async fn synchronize_wallet(&self, target_height: Option<u64>) -> anyhow::Result<()> {
-        let _guard = self.0.wallet_sync.lock().await;
-        if let Some(target) = target_height
-            && self
-                .0
-                .wallet_snapshot
-                .read()
-                .await
-                .status
-                .fully_scanned_height
-                .is_some_and(|height| height >= target)
-        {
-            return Ok(());
-        }
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let _guard = tokio::time::timeout_at(deadline, self.0.wallet_sync.lock()).await?;
 
         {
             let mut snapshot = self.0.wallet_snapshot.write().await;
@@ -114,10 +112,22 @@ impl AppState {
             if let Some(target) = target_height {
                 self.0
                     .wallet
-                    .wait_for_height(target, Duration::from_secs(120))
+                    .wait_for_height(target, deadline.saturating_duration_since(Instant::now()))
                     .await?;
             }
-            self.0.wallet.sync().await?;
+            let target = crate::reconcile::within_deadline(
+                deadline,
+                "reading the reconciliation target",
+                self.0.rpc.checkpoint(),
+            )
+            .await?;
+            if let Some(height) = target_height {
+                anyhow::ensure!(
+                    target.height >= height,
+                    "mined height is no longer canonical"
+                );
+            }
+            crate::reconcile::sync_wallet(&self.0.wallet, &self.0.rpc, &target, deadline).await?;
             self.refresh_wallet_snapshot().await
         }
         .await;
@@ -132,26 +142,29 @@ impl AppState {
     }
 
     async fn synchronize_latest(&self) -> anyhow::Result<()> {
-        let observed = self.0.wallet.latest_height().await?;
-        {
-            let mut snapshot = self.0.wallet_snapshot.write().await;
-            snapshot.status.observed_height = Some(observed);
-        }
-        self.synchronize_wallet(Some(observed)).await
+        self.synchronize_wallet(None).await
     }
 
     async fn refresh_wallet_snapshot(&self) -> anyhow::Result<()> {
         let mut accounts = self.0.store.accounts()?;
         self.0.wallet.apply_balances(&mut accounts).await?;
-        let (fully_scanned_height, chain_tip_height) = self.0.wallet.heights().await?;
+        let scanned = self.0.wallet.scanned_checkpoint().await?;
+        let observed = self.0.rpc.checkpoint().await?;
+        anyhow::ensure!(
+            scanned.as_ref() == Some(&observed)
+                || (observed.height < u64::from(WALLET_BIRTHDAY_HEIGHT) && scanned.is_none()),
+            "chain checkpoint changed before wallet publication"
+        );
         let changed = self.0.wallet_snapshot.read().await.accounts != accounts;
         {
             let mut snapshot = self.0.wallet_snapshot.write().await;
             snapshot.accounts = accounts;
             snapshot.status = WalletSyncStatus {
                 state: "ready",
-                fully_scanned_height,
-                observed_height: chain_tip_height,
+                fully_scanned_height: scanned.as_ref().map(|checkpoint| checkpoint.height),
+                fully_scanned_hash: scanned.as_ref().map(|checkpoint| checkpoint.hash.clone()),
+                observed_height: Some(observed.height),
+                observed_hash: Some(observed.hash),
                 last_success_at: Some(now_unix()),
                 error: None,
             };
@@ -165,20 +178,22 @@ impl AppState {
     }
 
     async fn sync_if_chain_advanced(&self) -> anyhow::Result<()> {
-        let observed = self.0.wallet.latest_height().await?;
+        let observed = self.0.rpc.checkpoint().await?;
+        let status = self.0.wallet_snapshot.read().await.status.clone();
+        let settled = status.state == "ready"
+            && ((status.fully_scanned_height == Some(observed.height)
+                && status.fully_scanned_hash.as_deref() == Some(&observed.hash))
+                || (observed.height < u64::from(WALLET_BIRTHDAY_HEIGHT)
+                    && status.fully_scanned_height.is_none()
+                    && status.observed_height == Some(observed.height)
+                    && status.observed_hash.as_deref() == Some(&observed.hash)));
         {
             let mut snapshot = self.0.wallet_snapshot.write().await;
-            snapshot.status.observed_height = Some(observed);
+            snapshot.status.observed_height = Some(observed.height);
+            snapshot.status.observed_hash = Some(observed.hash.clone());
         }
-        let scanned = self
-            .0
-            .wallet_snapshot
-            .read()
-            .await
-            .status
-            .fully_scanned_height;
-        if scanned.is_none_or(|height| height < observed) {
-            self.synchronize_wallet(Some(observed)).await?;
+        if !settled {
+            self.synchronize_wallet(Some(observed.height)).await?;
             notify(self, "chain");
         }
         Ok(())
@@ -468,6 +483,7 @@ async fn faucet_address(
     state.synchronize_latest().await?;
     let seed = state.0.store.seed()?;
     let treasury = state.0.store.account(TREASURY_ACCOUNT_ID)?;
+    let _replenishment = state.0.treasury_replenishment.lock().await;
     let txid =
         send_with_replenishment(&state, &seed, &treasury, &req.address, req.amount_zatoshi).await?;
     mine_and_sync(&state, 1).await?;
@@ -504,18 +520,13 @@ async fn fund_from_treasury(
     // SDK proposals check spendability and the actual fee before construction. Total
     // balances include pending change and cannot decide whether this request is fundable.
     let treasury = state.0.store.account(TREASURY_ACCOUNT_ID)?;
+    let _replenishment = state.0.treasury_replenishment.lock().await;
     let txid = send_with_replenishment(state, &seed, &treasury, &address, amount_zatoshi).await?;
     let pending = state
         .0
         .store
         .faucet(account_id, pool, amount_zatoshi, idempotency_key, &txid)?;
     confirm_after_mining(state, pending).await
-}
-
-#[derive(Deserialize)]
-struct TreasuryOutput {
-    txid: String,
-    height: u32,
 }
 
 #[async_trait::async_trait]
@@ -527,11 +538,38 @@ trait FaucetRuntime: Sync {
         amount_zatoshi: u64,
     ) -> anyhow::Result<String>;
     async fn chain_height(&self) -> anyhow::Result<u64>;
-    async fn treasury_outputs(&self, address: &str) -> anyhow::Result<Vec<TreasuryOutput>>;
-    async fn transaction(&self, txid: &str) -> anyhow::Result<Value>;
-    async fn enhance_transaction(&self, raw: &str, height: u32) -> anyhow::Result<()>;
-    async fn shield_coinbase(&self, seed: &str, treasury: &Account) -> anyhow::Result<()>;
+    async fn block_hash(&self, height: u32) -> anyhow::Result<String>;
+    async fn synchronize_latest(&self) -> anyhow::Result<()>;
+    async fn treasury_cursor(&self) -> anyhow::Result<Option<crate::db::TreasuryCursor>>;
+    async fn initialize_treasury_cursor(
+        &self,
+        receiver: &str,
+        height: u32,
+        hash: &str,
+    ) -> anyhow::Result<crate::db::TreasuryCursor>;
+    async fn discover_reward(
+        &self,
+        cursor: &crate::db::TreasuryCursor,
+        treasury: &Account,
+    ) -> anyhow::Result<crate::db::TreasuryCursor>;
+    async fn shield_coinbase(
+        &self,
+        seed: &str,
+        treasury: &Account,
+        minimum_net: u64,
+    ) -> anyhow::Result<()>;
     async fn mine_and_sync(&self, blocks: u32) -> anyhow::Result<()>;
+    async fn mine_to_height(&self, height: u64) -> anyhow::Result<()> {
+        let current = self.chain_height().await?;
+        if height > current {
+            self.mine_and_sync(u32::try_from(height - current)?).await?;
+        }
+        anyhow::ensure!(
+            self.chain_height().await? >= height,
+            "maturity mining did not reach height {height}"
+        );
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -559,22 +597,40 @@ impl FaucetRuntime for AppState {
         Ok(self.0.rpc.chain_info().await?.blocks)
     }
 
-    async fn treasury_outputs(&self, address: &str) -> anyhow::Result<Vec<TreasuryOutput>> {
+    async fn block_hash(&self, height: u32) -> anyhow::Result<String> {
+        self.0.rpc.block_hash(height).await
+    }
+    async fn synchronize_latest(&self) -> anyhow::Result<()> {
+        AppState::synchronize_latest(self).await
+    }
+    async fn treasury_cursor(&self) -> anyhow::Result<Option<crate::db::TreasuryCursor>> {
+        self.0.wallet.treasury_cursor().await
+    }
+    async fn initialize_treasury_cursor(
+        &self,
+        receiver: &str,
+        height: u32,
+        hash: &str,
+    ) -> anyhow::Result<crate::db::TreasuryCursor> {
         self.0
-            .rpc
-            .call("getaddressutxos", json!([{ "addresses": [address] }]))
+            .wallet
+            .initialize_treasury_cursor(receiver, height, hash)
             .await
     }
-
-    async fn transaction(&self, txid: &str) -> anyhow::Result<Value> {
-        self.0.rpc.transaction(txid).await
+    async fn discover_reward(
+        &self,
+        cursor: &crate::db::TreasuryCursor,
+        treasury: &Account,
+    ) -> anyhow::Result<crate::db::TreasuryCursor> {
+        let _sync = self.0.wallet_sync.lock().await;
+        discover_reward(self, cursor, treasury).await
     }
-
-    async fn enhance_transaction(&self, raw: &str, height: u32) -> anyhow::Result<()> {
-        self.0.wallet.enhance_transaction(raw, height).await
-    }
-
-    async fn shield_coinbase(&self, seed: &str, treasury: &Account) -> anyhow::Result<()> {
+    async fn shield_coinbase(
+        &self,
+        seed: &str,
+        treasury: &Account,
+        minimum_net: u64,
+    ) -> anyhow::Result<()> {
         self.0
             .wallet
             .shield_coinbase(
@@ -582,6 +638,7 @@ impl FaucetRuntime for AppState {
                 TREASURY_ACCOUNT_ID,
                 &treasury.transparent_address,
                 &treasury.unified_address,
+                minimum_net,
             )
             .await?;
         Ok(())
@@ -593,6 +650,93 @@ impl FaucetRuntime for AppState {
     }
 }
 
+async fn discover_reward(
+    state: &AppState,
+    cursor: &crate::db::TreasuryCursor,
+    treasury: &Account,
+) -> anyhow::Result<crate::db::TreasuryCursor> {
+    let next_height = cursor
+        .height
+        .checked_add(1)
+        .context("treasury discovery height overflow")?;
+    let block_hash = state.0.rpc.block_hash(next_height).await?;
+    let block = state.0.rpc.block(&block_hash).await?;
+    anyhow::ensure!(
+        block.get("height").and_then(Value::as_u64) == Some(u64::from(next_height)),
+        "Zakura returned the wrong treasury discovery height"
+    );
+    let candidate = coinbase_candidate(&block, &treasury.transparent_address)?;
+    let mut required_spenders = Vec::new();
+    if let Some(candidate) = &candidate {
+        for index in &candidate.output_indexes {
+            if state
+                .0
+                .rpc
+                .unspent_output(&candidate.txid, *index)
+                .await?
+                .is_none()
+            {
+                let spenders = state
+                    .0
+                    .wallet
+                    .known_spending_transactions(&candidate.txid, *index)
+                    .await?;
+                let mut accepted = Vec::new();
+                for txid in spenders {
+                    let Some(transaction) = state.0.rpc.lookup_transaction(&txid).await? else {
+                        continue;
+                    };
+                    if let Some(hash) = confirmed_block_hash(&transaction) {
+                        let height = state
+                            .0
+                            .rpc
+                            .block(hash)
+                            .await?
+                            .get("height")
+                            .and_then(Value::as_u64)
+                            .context("spender block omitted its height")?;
+                        anyhow::ensure!(
+                            state.0.rpc.block_hash(u32::try_from(height)?).await? == hash,
+                            "spender block is not canonical"
+                        );
+                    } else if !state.0.rpc.mempool().await?.contains(&txid) {
+                        continue;
+                    }
+                    accepted.push((*index, txid));
+                }
+                anyhow::ensure!(
+                    !accepted.is_empty(),
+                    "treasury output has no known spender; discovery remains pending"
+                );
+                required_spenders.extend(accepted);
+            }
+        }
+    }
+    let checkpoint = ChainCheckpoint {
+        height: u64::from(next_height),
+        hash: block_hash,
+    };
+    anyhow::ensure!(
+        state.0.rpc.block_hash(next_height).await? == checkpoint.hash,
+        "canonical block changed during treasury discovery"
+    );
+    let next = state
+        .0
+        .wallet
+        .commit_treasury_discovery(
+            cursor,
+            &checkpoint,
+            candidate.as_ref().map(|value| value.raw.as_str()),
+            &required_spenders,
+        )
+        .await?;
+    anyhow::ensure!(
+        state.0.rpc.block_hash(next_height).await? == checkpoint.hash,
+        "canonical block changed after treasury discovery"
+    );
+    Ok(next)
+}
+
 async fn send_with_replenishment<R: FaucetRuntime>(
     runtime: &R,
     seed: &str,
@@ -600,77 +744,157 @@ async fn send_with_replenishment<R: FaucetRuntime>(
     destination: &str,
     amount_zatoshi: u64,
 ) -> anyhow::Result<String> {
-    match runtime
-        .send_payment(seed, destination, amount_zatoshi)
-        .await
-    {
-        Err(error)
-            if matches!(
-                error.downcast_ref(),
-                Some(PaymentError::InsufficientFunds { .. })
-            ) =>
+    let mut reconciled_after_scan_required = false;
+    loop {
+        match runtime
+            .send_payment(seed, destination, amount_zatoshi)
+            .await
         {
-            replenish_treasury(runtime, seed, treasury).await?;
-            runtime
-                .send_payment(seed, destination, amount_zatoshi)
-                .await
-                .map_err(|error| {
-                    if matches!(
-                        error.downcast_ref(),
-                        Some(PaymentError::InsufficientFunds { .. })
-                    ) {
-                        anyhow::Error::new(PaymentError::TreasuryExhausted)
-                    } else {
-                        error
+            Ok(txid) => return Ok(txid),
+            Err(error) => {
+                if matches!(error.downcast_ref(), Some(PaymentError::ScanRequired)) {
+                    if !reconciled_after_scan_required {
+                        runtime.synchronize_latest().await?;
+                        reconciled_after_scan_required = true;
+                        continue;
                     }
-                })
+                    if runtime.chain_height().await? < u64::from(WALLET_BIRTHDAY_HEIGHT) {
+                        runtime
+                            .mine_to_height(u64::from(WALLET_BIRTHDAY_HEIGHT))
+                            .await?;
+                        runtime.synchronize_latest().await?;
+                        continue;
+                    }
+                    return Err(error);
+                }
+                let Some(PaymentError::InsufficientFunds {
+                    available,
+                    required,
+                }) = error.downcast_ref()
+                else {
+                    return Err(error);
+                };
+                let minimum_net = required
+                    .checked_sub(*available)
+                    .filter(|value| *value > 0)
+                    .context("SDK insufficient-funds result has no positive deficit")?;
+                replenish_treasury(runtime, seed, treasury, minimum_net).await?;
+                reconciled_after_scan_required = false;
+            }
         }
-        result => result,
     }
-}
-
-async fn mature_treasury_outputs<R: FaucetRuntime>(
-    runtime: &R,
-    treasury: &Account,
-) -> anyhow::Result<Vec<TreasuryOutput>> {
-    let height = runtime.chain_height().await?;
-    let mut outputs = runtime
-        .treasury_outputs(&treasury.transparent_address)
-        .await?;
-    // The wallet birthday is block 2; block 1 is deliberately outside its scan.
-    outputs.retain(|output| {
-        output.height >= 2
-            && u64::from(output.height) + u64::from(COINBASE_MATURITY_BLOCKS) <= height
-    });
-    Ok(outputs)
 }
 
 async fn replenish_treasury<R: FaucetRuntime>(
     runtime: &R,
     seed: &str,
     treasury: &Account,
+    minimum_net: u64,
 ) -> anyhow::Result<()> {
-    let mut outputs = mature_treasury_outputs(runtime, treasury).await?;
-    if outputs.is_empty() {
-        runtime.mine_and_sync(102).await?;
-        outputs = mature_treasury_outputs(runtime, treasury).await?;
-    }
-    // lightwalletd UTXOs omit tx_index, so enhance all mature rewards before
-    // the SDK's coinbase-only selector evaluates them.
-    for output in outputs {
-        let tx = runtime.transaction(&output.txid).await?;
-        if tx.pointer("/vin/0/coinbase").is_none() {
-            continue;
+    let boundary = WALLET_BIRTHDAY_HEIGHT - 1;
+    runtime.mine_to_height(u64::from(boundary)).await?;
+    let mut cursor = match runtime.treasury_cursor().await? {
+        Some(cursor) => {
+            anyhow::ensure!(
+                cursor.receiver == treasury.transparent_address,
+                "treasury cursor belongs to a different receiver"
+            );
+            cursor
         }
-        let raw = tx
-            .get("hex")
-            .and_then(Value::as_str)
-            .context("Zakura omitted coinbase transaction hex")?;
-        runtime.enhance_transaction(raw, output.height).await?;
+        None => {
+            let hash = runtime.block_hash(boundary).await?;
+            runtime
+                .initialize_treasury_cursor(&treasury.transparent_address, boundary, &hash)
+                .await?
+        }
+    };
+    if runtime.chain_height().await? < u64::from(cursor.height)
+        || runtime.block_hash(cursor.height).await? != cursor.block_hash
+    {
+        runtime.synchronize_latest().await?;
+        cursor = runtime
+            .treasury_cursor()
+            .await?
+            .context("treasury cursor disappeared during rewind")?;
+        anyhow::ensure!(
+            runtime.chain_height().await? >= u64::from(cursor.height)
+                && runtime.block_hash(cursor.height).await? == cursor.block_hash,
+            "treasury cursor is not canonical after wallet rewind"
+        );
     }
-    runtime.shield_coinbase(seed, treasury).await?;
-    runtime.mine_and_sync(1).await?;
-    Ok(())
+
+    loop {
+        match runtime.shield_coinbase(seed, treasury, minimum_net).await {
+            Ok(()) => return runtime.mine_and_sync(1).await,
+            Err(error) if matches!(error.downcast_ref(), Some(PaymentError::TreasuryExhausted)) => {
+            }
+            Err(error) => return Err(error),
+        }
+        let next_height = cursor
+            .height
+            .checked_add(1)
+            .context("treasury discovery height overflow")?;
+        // The SDK constructs a spend at tip + 1; 100 confirmations make this reward eligible there.
+        let required_height = u64::from(next_height) + u64::from(COINBASE_MATURITY_BLOCKS) - 1;
+        runtime.mine_to_height(required_height).await?;
+        cursor = runtime.discover_reward(&cursor, treasury).await?;
+    }
+}
+
+struct CoinbaseCandidate {
+    txid: String,
+    raw: String,
+    output_indexes: Vec<u32>,
+}
+
+fn coinbase_candidate(block: &Value, receiver: &str) -> anyhow::Result<Option<CoinbaseCandidate>> {
+    let height = block
+        .get("height")
+        .and_then(Value::as_u64)
+        .and_then(|height| u32::try_from(height).ok())
+        .context("Zakura block omitted its height")?;
+    let transaction = block
+        .get("tx")
+        .and_then(Value::as_array)
+        .and_then(|transactions| transactions.first())
+        .context("Zakura block omitted its coinbase transaction")?;
+    let raw = transaction
+        .get("hex")
+        .and_then(Value::as_str)
+        .context("Zakura coinbase omitted its raw transaction")?;
+    let bytes = hex::decode(raw).context("invalid treasury transaction hex")?;
+    let decoded = zcash_primitives::transaction::Transaction::read(
+        &bytes[..],
+        zcash_protocol::consensus::BranchId::for_height(&regtest_network(), height.into()),
+    )?;
+    let txid = decoded.txid().to_string();
+    anyhow::ensure!(
+        transaction.get("txid").and_then(Value::as_str) == Some(txid.as_str()),
+        "Zakura coinbase transaction ID does not match its raw transaction"
+    );
+    let bundle = decoded
+        .transparent_bundle()
+        .filter(|bundle| bundle.is_coinbase())
+        .context("Zakura block's first transaction is not coinbase")?;
+    let output_indexes = bundle
+        .vout
+        .iter()
+        .enumerate()
+        .filter_map(|(index, output)| {
+            output
+                .recipient_address()
+                .filter(|address| address.encode(&regtest_network()) == receiver)
+                .map(|_| u32::try_from(index).context("treasury output index exceeds u32"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    if output_indexes.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(CoinbaseCandidate {
+        txid,
+        raw: raw.to_owned(),
+        output_indexes,
+    }))
 }
 
 async fn mine_and_sync(state: &AppState, blocks: u32) -> anyhow::Result<Vec<String>> {
@@ -710,7 +934,7 @@ pub async fn provision_initial_balance(state: &AppState) -> anyhow::Result<()> {
         .is_none()
     {
         // A fresh wallet needs scanned blocks before a proposal can determine its target height.
-        replenish_treasury(state, &seed, &treasury).await?;
+        replenish_treasury(state, &seed, &treasury, 1).await?;
     }
     fund_from_treasury(
         state,
@@ -1683,11 +1907,24 @@ mod tests {
         );
     }
 
-    #[derive(Default)]
     struct RecordingFaucetRuntime {
         events: Mutex<Vec<String>>,
         funds_available: AtomicBool,
-        height_checks: AtomicUsize,
+        reward_discovered: AtomicBool,
+        height: AtomicUsize,
+        cursor: Mutex<Option<crate::db::TreasuryCursor>>,
+    }
+
+    impl Default for RecordingFaucetRuntime {
+        fn default() -> Self {
+            Self {
+                events: Mutex::new(Vec::new()),
+                funds_available: AtomicBool::new(false),
+                reward_discovered: AtomicBool::new(false),
+                height: AtomicUsize::new(2),
+                cursor: Mutex::new(None),
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -1708,52 +1945,72 @@ mod tests {
                 }))
             }
         }
-
         async fn chain_height(&self) -> anyhow::Result<u64> {
-            let check = self.height_checks.fetch_add(1, Ordering::SeqCst);
-            let height = if check == 0 { 101 } else { 203 };
-            self.events.lock().unwrap().push(format!("height:{height}"));
-            Ok(height)
+            Ok(self.height.load(Ordering::SeqCst) as u64)
         }
-
-        async fn treasury_outputs(&self, _address: &str) -> anyhow::Result<Vec<TreasuryOutput>> {
-            self.events.lock().unwrap().push("outputs".into());
-            Ok(vec![TreasuryOutput {
-                txid: "coinbase-txid".into(),
-                height: 2,
-            }])
+        async fn block_hash(&self, height: u32) -> anyhow::Result<String> {
+            Ok(format!("{height:064x}"))
         }
-
-        async fn transaction(&self, txid: &str) -> anyhow::Result<Value> {
-            self.events
-                .lock()
-                .unwrap()
-                .push(format!("transaction:{txid}"));
-            Ok(json!({"vin":[{"coinbase":"00"}],"hex":"raw-coinbase"}))
-        }
-
-        async fn enhance_transaction(&self, raw: &str, height: u32) -> anyhow::Result<()> {
-            self.events
-                .lock()
-                .unwrap()
-                .push(format!("enhance:{raw}:{height}"));
+        async fn synchronize_latest(&self) -> anyhow::Result<()> {
+            self.events.lock().unwrap().push("sync".into());
             Ok(())
         }
-
-        async fn shield_coinbase(&self, _seed: &str, _treasury: &Account) -> anyhow::Result<()> {
+        async fn treasury_cursor(&self) -> anyhow::Result<Option<crate::db::TreasuryCursor>> {
+            Ok(self.cursor.lock().unwrap().clone())
+        }
+        async fn initialize_treasury_cursor(
+            &self,
+            receiver: &str,
+            height: u32,
+            hash: &str,
+        ) -> anyhow::Result<crate::db::TreasuryCursor> {
+            let cursor = crate::db::TreasuryCursor {
+                receiver: receiver.into(),
+                height,
+                block_hash: hash.into(),
+            };
+            *self.cursor.lock().unwrap() = Some(cursor.clone());
+            Ok(cursor)
+        }
+        async fn discover_reward(
+            &self,
+            cursor: &crate::db::TreasuryCursor,
+            _treasury: &Account,
+        ) -> anyhow::Result<crate::db::TreasuryCursor> {
+            assert_eq!(cursor.height, 1);
+            self.events.lock().unwrap().push("discover:2".into());
+            self.reward_discovered.store(true, Ordering::SeqCst);
+            let cursor = crate::db::TreasuryCursor {
+                receiver: cursor.receiver.clone(),
+                height: 2,
+                block_hash: format!("{:064x}", 2),
+            };
+            *self.cursor.lock().unwrap() = Some(cursor.clone());
+            Ok(cursor)
+        }
+        async fn shield_coinbase(
+            &self,
+            _seed: &str,
+            _treasury: &Account,
+            minimum_net: u64,
+        ) -> anyhow::Result<()> {
+            assert_eq!(minimum_net, 100_010_000);
             self.events.lock().unwrap().push("shield".into());
+            if !self.reward_discovered.load(Ordering::SeqCst) {
+                return Err(anyhow::Error::new(PaymentError::TreasuryExhausted));
+            }
             self.funds_available.store(true, Ordering::SeqCst);
             Ok(())
         }
-
         async fn mine_and_sync(&self, blocks: u32) -> anyhow::Result<()> {
             self.events.lock().unwrap().push(format!("mine:{blocks}"));
+            self.height.fetch_add(blocks as usize, Ordering::SeqCst);
             Ok(())
         }
     }
 
     #[tokio::test]
-    async fn insufficient_funds_replenishes_from_mature_rewards_and_retries() {
+    async fn insufficient_funds_discovers_only_the_needed_mature_reward_and_retries() {
         let runtime = RecordingFaucetRuntime::default();
         let treasury = Account {
             id: TREASURY_ACCOUNT_ID,
@@ -1774,22 +2031,18 @@ mod tests {
         )
         .await
         .unwrap();
-
         assert_eq!(txid, "recovered-txid");
+        assert_eq!(runtime.cursor.lock().unwrap().as_ref().unwrap().height, 2);
         assert_eq!(
             runtime.events.into_inner().unwrap(),
             [
                 "send",
-                "height:101",
-                "outputs",
-                "mine:102",
-                "height:203",
-                "outputs",
-                "transaction:coinbase-txid",
-                "enhance:raw-coinbase:2",
+                "shield",
+                "mine:99",
+                "discover:2",
                 "shield",
                 "mine:1",
-                "send",
+                "send"
             ]
         );
     }
