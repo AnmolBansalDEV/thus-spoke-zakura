@@ -42,8 +42,8 @@ export function SendDialog({
     defaultValues: {
       from_account: String(fromAccountId),
       to_account: String(accounts.find((account) => account.id !== fromAccountId)?.id ?? 1),
-      source_pool: 'orchard',
-      destination_pool: 'orchard',
+      source_pool: 'ironwood',
+      destination_pool: 'ironwood',
       amount: '1',
       memo: '',
     },
@@ -53,9 +53,9 @@ export function SendDialog({
   const sourcePool = useWatch({ control: form.control, name: 'source_pool' });
   const destinationPool = useWatch({ control: form.control, name: 'destination_pool' });
   const memo = useWatch({ control: form.control, name: 'memo' }) ?? '';
-  const memoEnabled = destinationPool === 'orchard';
+  const memoEnabled = destinationPool === 'ironwood';
 
-  // A memo typed for an orchard output must not linger (hidden) once the
+  // A memo typed for an ironwood output must not linger (hidden) once the
   // destination switches to transparent, where it can never be sent.
   useEffect(() => {
     if (!memoEnabled) {
@@ -68,8 +68,8 @@ export function SendDialog({
   const available =
     source === undefined
       ? 0n
-      : sourcePool === 'orchard'
-        ? source.orchard_zatoshi
+      : sourcePool === 'ironwood'
+        ? source.ironwood_zatoshi
         : source.transparent_zatoshi;
 
   // The quote is a dry-run proposal, so its fee reflects real input selection.
@@ -203,7 +203,7 @@ export function SendDialog({
           hint={
             memoEnabled
               ? `${memoByteLength(memo)}/${MEMO_MAX_BYTES} bytes, encrypted to the recipient.`
-              : 'Memos are only available for orchard destinations.'
+              : 'Memos are only available for ironwood destinations.'
           }
           error={form.formState.errors.memo?.message}
         >

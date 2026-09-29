@@ -12,7 +12,7 @@ use zcash_keys::{
     address::Address,
     keys::{Era, UnifiedAddressRequest, UnifiedFullViewingKey, UnifiedSpendingKey},
 };
-use zcash_protocol::{consensus::BlockHeight, local_consensus::LocalNetwork};
+use zcash_protocol::local_consensus::LocalNetwork;
 
 pub const ZATOSHIS_PER_ZEC: u64 = 100_000_000;
 pub const USER_ACCOUNT_COUNT: u8 = 5;
@@ -37,7 +37,7 @@ pub struct Account {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unified_full_viewing_key: Option<String>,
     pub transparent_zatoshi: u64,
-    pub orchard_zatoshi: u64,
+    pub ironwood_zatoshi: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +81,7 @@ impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let connection = Connection::open(path)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
+        migrate_balance_columns(&connection)?;
         Ok(Self(Arc::new(Mutex::new(connection))))
     }
 
@@ -91,7 +92,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS accounts (
                 id INTEGER PRIMARY KEY, name TEXT NOT NULL, unified_address TEXT NOT NULL,
                 transparent_address TEXT NOT NULL, transparent_zatoshi INTEGER NOT NULL DEFAULT 0,
-                orchard_zatoshi INTEGER NOT NULL DEFAULT 0
+                ironwood_zatoshi INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS activity (
                 id TEXT PRIMARY KEY, kind TEXT NOT NULL, from_account INTEGER, to_account INTEGER NOT NULL,
@@ -148,7 +149,7 @@ impl Store {
     pub fn accounts(&self) -> Result<Vec<Account>> {
         let mut accounts = {
             let db = self.0.lock().unwrap();
-            let mut query = db.prepare("SELECT id,name,unified_address,transparent_address,transparent_zatoshi,orchard_zatoshi FROM accounts ORDER BY id")?;
+            let mut query = db.prepare("SELECT id,name,unified_address,transparent_address,transparent_zatoshi,ironwood_zatoshi FROM accounts ORDER BY id")?;
             query
                 .query_map([], row_account)?
                 .collect::<rusqlite::Result<Vec<_>>>()?
@@ -174,7 +175,7 @@ impl Store {
     }
 
     pub fn account(&self, id: u8) -> Result<Account> {
-        self.0.lock().unwrap().query_row("SELECT id,name,unified_address,transparent_address,transparent_zatoshi,orchard_zatoshi FROM accounts WHERE id=?1", [id], row_account).with_context(|| format!("account {id} does not exist"))
+        self.0.lock().unwrap().query_row("SELECT id,name,unified_address,transparent_address,transparent_zatoshi,ironwood_zatoshi FROM accounts WHERE id=?1", [id], row_account).with_context(|| format!("account {id} does not exist"))
     }
 
     pub fn activities(&self, limit: u32) -> Result<Vec<Activity>> {
@@ -264,7 +265,7 @@ impl Store {
         }
         let mut db = self.0.lock().unwrap();
         if let Some(activity) = activity_for_key(&db, key)? {
-            ensure_same_payment(&activity, "faucet", None, to, "orchard", pool, amount)?;
+            ensure_same_payment(&activity, "faucet", None, to, "ironwood", pool, amount)?;
             return Ok(activity);
         }
         if !db.query_row(
@@ -275,7 +276,7 @@ impl Store {
             bail!("account {to} does not exist");
         }
         let tx = db.transaction()?;
-        let activity = new_activity("faucet", None, to, "orchard", pool, amount);
+        let activity = new_activity("faucet", None, to, "ironwood", pool, amount);
         insert_activity(&tx, &activity, key, None)?;
         tx.commit()?;
         Ok(activity)
@@ -475,10 +476,10 @@ fn new_activity(
     }
 }
 fn validate_pool(pool: &str) -> Result<()> {
-    if matches!(pool, "transparent" | "orchard") {
+    if matches!(pool, "transparent" | "ironwood") {
         Ok(())
     } else {
-        bail!("pool must be transparent or orchard")
+        bail!("pool must be transparent or ironwood")
     }
 }
 
@@ -511,8 +512,31 @@ fn row_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
         transparent_address: row.get(3)?,
         unified_full_viewing_key: None,
         transparent_zatoshi: row.get(4)?,
-        orchard_zatoshi: row.get(5)?,
+        ironwood_zatoshi: row.get(5)?,
     })
+}
+
+/// Stores created before NU6.3 have an `orchard_zatoshi` balance column. The
+/// Orchard pool can't receive funds on this chain, so the column is dropped
+/// rather than renamed: an old Orchard figure must not show up as Ironwood.
+fn migrate_balance_columns(db: &Connection) -> Result<()> {
+    let columns = db
+        .prepare("PRAGMA table_info(accounts)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if columns.is_empty() {
+        return Ok(());
+    }
+    if columns.iter().any(|column| column == "orchard_zatoshi") {
+        db.execute("ALTER TABLE accounts DROP COLUMN orchard_zatoshi", [])?;
+    }
+    if !columns.iter().any(|column| column == "ironwood_zatoshi") {
+        db.execute(
+            "ALTER TABLE accounts ADD COLUMN ironwood_zatoshi INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
 }
 fn row_activity(row: &rusqlite::Row<'_>) -> rusqlite::Result<Activity> {
     Ok(Activity {
@@ -554,19 +578,7 @@ fn derived_addresses(seed: &[u8], id: u8) -> Result<(String, String)> {
 }
 
 fn local_network() -> LocalNetwork {
-    let one = Some(BlockHeight::from_u32(1));
-    LocalNetwork {
-        overwinter: one,
-        sapling: one,
-        blossom: one,
-        heartwood: one,
-        canopy: one,
-        nu5: one,
-        nu6: one,
-        nu6_1: None,
-        nu6_2: None,
-        nu6_3: None,
-    }
+    crate::wallet::regtest_network()
 }
 
 #[cfg(test)]
@@ -591,13 +603,13 @@ mod tests {
                 .starts_with("tm")
         );
         let first = store
-            .claim_faucet(2, "orchard", ZATOSHIS_PER_ZEC, "same")
+            .claim_faucet(2, "ironwood", ZATOSHIS_PER_ZEC, "same")
             .unwrap();
         let second = store
-            .claim_faucet(2, "orchard", ZATOSHIS_PER_ZEC, "same")
+            .claim_faucet(2, "ironwood", ZATOSHIS_PER_ZEC, "same")
             .unwrap();
         assert_eq!(first.id, second.id);
-        assert_eq!(store.account(2).unwrap().orchard_zatoshi, 0);
+        assert_eq!(store.account(2).unwrap().ironwood_zatoshi, 0);
     }
     #[test]
     fn fresh_stores_derive_the_same_development_accounts() {
@@ -694,7 +706,8 @@ mod tests {
             assert!(encoded == expected);
             assert!(distinct.insert(encoded.to_owned()));
             assert_eq!(account.transparent_zatoshi, 123);
-            assert_eq!(account.orchard_zatoshi, 456);
+            // The legacy Orchard balance is dropped, not carried into Ironwood.
+            assert_eq!(account.ironwood_zatoshi, 0);
         }
 
         let all = store.accounts().unwrap();
@@ -731,7 +744,7 @@ mod tests {
                     "unified_address",
                     "transparent_address",
                     "transparent_zatoshi",
-                    "orchard_zatoshi",
+                    "ironwood_zatoshi",
                 ]
             );
             let metadata_keys = db
@@ -752,7 +765,7 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let activity = store
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "send", None)
+            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "send", None)
             .unwrap();
         let activity = store
             .record_prepared(&activity.id, "real-txid", b"raw transaction", 140)
@@ -767,17 +780,17 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         store
-            .claim_transfer(1, 2, "orchard", "orchard", 11_000, "preparing-key", None)
+            .claim_transfer(1, 2, "ironwood", "ironwood", 11_000, "preparing-key", None)
             .unwrap();
         let pending = store
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "pending-key", None)
+            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "pending-key", None)
             .unwrap();
         let pending = store
             .record_prepared(&pending.id, "txid-pending", b"pending", 140)
             .unwrap();
         let pending = store.mark_broadcast(&pending.id, &pending.txid).unwrap();
         let mined = store
-            .claim_transfer(1, 3, "orchard", "orchard", 13_000, "mined-key", None)
+            .claim_transfer(1, 3, "ironwood", "ironwood", 13_000, "mined-key", None)
             .unwrap();
         let mined = store
             .record_prepared(&mined.id, "txid-mined", b"mined", 140)
@@ -799,7 +812,7 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let pending = store
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "empty-hash", None)
+            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "empty-hash", None)
             .unwrap();
         let pending = store
             .record_prepared(&pending.id, "txid-empty", b"raw", 140)
@@ -808,7 +821,7 @@ mod tests {
 
         assert!(store.confirm(&pending.id, &pending.txid, "").is_err());
         let again = store
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "empty-hash", None)
+            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "empty-hash", None)
             .unwrap();
         assert_eq!(again.id, pending.id);
         assert_eq!(again.status, "broadcast");
@@ -820,18 +833,18 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         store
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same", None)
+            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
             .unwrap();
 
         let error = store
-            .claim_transfer(1, 2, "orchard", "orchard", 13_000, "same", None)
+            .claim_transfer(1, 2, "ironwood", "ironwood", 13_000, "same", None)
             .unwrap_err();
 
         assert!(error.to_string().contains("different payment"));
         assert!(error.downcast_ref::<IdempotencyConflict>().is_some());
 
         let error = store
-            .claim_faucet(2, "orchard", 12_000, "same")
+            .claim_faucet(2, "ironwood", 12_000, "same")
             .unwrap_err();
         assert!(error.downcast_ref::<IdempotencyConflict>().is_some());
     }
@@ -841,18 +854,34 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let first = store
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "memo-key", Some("rent"))
+            .claim_transfer(
+                1,
+                2,
+                "ironwood",
+                "ironwood",
+                12_000,
+                "memo-key",
+                Some("rent"),
+            )
             .unwrap();
         assert_eq!(
             store
-                .claim_transfer(1, 2, "orchard", "orchard", 12_000, "memo-key", Some("rent"))
+                .claim_transfer(
+                    1,
+                    2,
+                    "ironwood",
+                    "ironwood",
+                    12_000,
+                    "memo-key",
+                    Some("rent")
+                )
                 .unwrap()
                 .id,
             first.id
         );
         for memo in [None, Some(""), Some("gift")] {
             let error = store
-                .claim_transfer(1, 2, "orchard", "orchard", 12_000, "memo-key", memo)
+                .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "memo-key", memo)
                 .unwrap_err();
             assert!(error.downcast_ref::<IdempotencyConflict>().is_some());
         }
@@ -871,7 +900,15 @@ mod tests {
             .unwrap();
         store.initialize().unwrap();
         store
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "memo-key", Some("rent"))
+            .claim_transfer(
+                1,
+                2,
+                "ironwood",
+                "ironwood",
+                12_000,
+                "memo-key",
+                Some("rent"),
+            )
             .unwrap();
         assert_eq!(
             store
@@ -900,7 +937,7 @@ mod tests {
                 std::thread::spawn(move || {
                     barrier.wait();
                     store
-                        .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same", None)
+                        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
                         .unwrap()
                 })
             })
@@ -920,14 +957,14 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let failed = store
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same", None)
+            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
             .unwrap();
 
         store.discard_preparing(&failed.id).unwrap();
 
         assert!(store.activity_for_key("same").unwrap().is_none());
         let retry = store
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same", None)
+            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
             .unwrap();
         assert_ne!(retry.id, failed.id);
     }
@@ -937,7 +974,7 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let claim = store
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same", None)
+            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
             .unwrap();
         store
             .record_prepared(&claim.id, "expired-txid", b"signed transaction", 140)
@@ -956,7 +993,7 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let claim = store
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same", None)
+            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
             .unwrap();
         let first = store
             .record_prepared(&claim.id, "real-txid", b"signed transaction", 140)
@@ -976,7 +1013,7 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let claim = store
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same", None)
+            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
             .unwrap();
         let prepared = store
             .record_prepared(&claim.id, "real-txid", b"signed transaction", 140)
@@ -1012,7 +1049,7 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let claim = store
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same", None)
+            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
             .unwrap();
         store
             .record_prepared(&claim.id, "old-txid", b"old transaction", 140)
@@ -1033,7 +1070,7 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let claim = store
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same", None)
+            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
             .unwrap();
         store
             .record_prepared(&claim.id, "real-txid", b"transaction", 140)
@@ -1055,7 +1092,7 @@ mod tests {
         let store = Store::open(&path).unwrap();
         store.initialize().unwrap();
         let claim = store
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same", None)
+            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
             .unwrap();
         let id = claim.id.clone();
         store
@@ -1066,7 +1103,7 @@ mod tests {
         let reopened = Store::open(path).unwrap();
         reopened.initialize().unwrap();
         let recovered = reopened
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same", None)
+            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
             .unwrap();
 
         assert_eq!(recovered.txid, "real-txid");

@@ -137,7 +137,7 @@ pub enum PaymentError {
     InsufficientFunds { available: u64, required: u64 },
     #[error("faucet treasury remains insufficient after replenishment")]
     TreasuryExhausted,
-    #[error("memos can only be sent to the orchard pool; transparent outputs cannot carry a memo")]
+    #[error("memos can only be sent to the ironwood pool; transparent outputs cannot carry a memo")]
     TransparentMemo,
     #[error("wallet requires reconciliation before constructing a payment")]
     ScanRequired,
@@ -256,6 +256,9 @@ impl BlockSource for MemoryBlockCache {
     }
 }
 
+/// Every upgrade through NU6.3 activates at height 1, so the Orchard pool never
+/// accepts deposits on this chain and all new shielded value lives in Ironwood.
+/// Keep these heights in sync with the Zakura configuration in `main.rs`.
 pub fn regtest_network() -> LocalNetwork {
     let one = Some(BlockHeight::from_u32(1));
     LocalNetwork {
@@ -266,9 +269,9 @@ pub fn regtest_network() -> LocalNetwork {
         canopy: one,
         nu5: one,
         nu6: one,
-        nu6_1: None,
-        nu6_2: None,
-        nu6_3: None,
+        nu6_1: one,
+        nu6_2: one,
+        nu6_3: one,
     }
 }
 
@@ -570,7 +573,7 @@ impl RealWallet {
         for (account, wallet_id) in accounts.iter_mut().zip(&self.account_ids) {
             if let Some(balance) = summary.account_balances().get(wallet_id) {
                 account.transparent_zatoshi = u64::from(balance.unshielded_balance().total());
-                account.orchard_zatoshi = u64::from(balance.orchard_balance().total());
+                account.ironwood_zatoshi = u64::from(balance.ironwood_balance().total());
             }
         }
         Ok(())
@@ -617,7 +620,7 @@ impl RealWallet {
             let change = SingleOutputChangeStrategy::<DbT>::new(
                 StandardFeeRule::Zip317,
                 None,
-                ShieldedPool::Orchard,
+                ShieldedPool::Ironwood,
                 DustOutputPolicy::default(),
             );
             let policy = SpendPolicy::shielded_pools([])
@@ -634,7 +637,9 @@ impl RealWallet {
                 None,
                 None,
             )
-        } else if source_pool == "orchard" {
+        } else if source_pool == "ironwood" {
+            // Once NU6.3 is active the SDK builds a unified-address payment's
+            // Orchard receiver as an Ironwood output, and routes change there too.
             propose_standard_transfer_to_address::<_, _, Infallible>(
                 db,
                 params,
@@ -645,12 +650,12 @@ impl RealWallet {
                 amount,
                 memo,
                 None,
-                ShieldedPool::Orchard,
+                ShieldedPool::Ironwood,
                 None,
                 None,
             )
         } else {
-            bail!("source pool must be transparent or orchard")
+            bail!("source pool must be transparent or ironwood")
         }
         .map_err(|error| match error {
             WalletError::InsufficientFunds {
@@ -832,12 +837,12 @@ impl RealWallet {
     where
         DbT: ProposalDb,
     {
-        if source_pool == "orchard" {
+        if source_pool == "ironwood" {
             match propose_send_max_transfer::<_, _, _, Infallible>(
                 db,
                 params,
                 account_id,
-                &[ShieldedPool::Orchard],
+                &[ShieldedPool::Ironwood],
                 &StandardFeeRule::Zip317,
                 recipient.to_zcash_address(params),
                 None,
@@ -929,7 +934,7 @@ impl RealWallet {
                 Ok(_) => bail!("a send of the entire balance proposed cleanly"),
             }
         } else {
-            bail!("source pool must be transparent or orchard")
+            bail!("source pool must be transparent or ironwood")
         }
     }
 
@@ -1180,21 +1185,58 @@ mod prepared_tests {
     };
     use zcash_client_backend::{
         data_api::testing::{
-            orchard::OrchardPoolTester,
-            pool::dsl::{TestDsl, TestScenario},
+            self, AddressType, IronwoodFvk, TestBuilder, orchard::OrchardPoolTester,
+            pool::ShieldedPoolTester,
         },
         wallet::WalletTransparentOutput,
     };
-    use zcash_client_sqlite::testing::{BlockCache, db::TestDbFactory};
+    use zcash_client_sqlite::testing::{
+        BlockCache,
+        db::{TestDb, TestDbFactory},
+    };
     use zcash_keys::keys::UnifiedAddressRequest;
+    use zcash_primitives::block::BlockHash;
 
     use super::*;
 
-    type TestState = TestDsl<TestScenario<OrchardPoolTester, BlockCache, TestDbFactory>>;
+    type TestState = testing::TestState<BlockCache, TestDb, LocalNetwork>;
 
+    /// The SDK's default test network with every upgrade through NU6.3 active from
+    /// Sapling activation, like the local chain, so shielded value lives in Ironwood.
     fn test_state() -> TestState {
-        TestDsl::with_sapling_birthday_account(TestDbFactory::default(), BlockCache::new())
-            .build::<OrchardPoolTester>()
+        let activation = Some(BlockHeight::from_u32(100_000));
+        let network = LocalNetwork {
+            nu6: activation,
+            nu6_1: activation,
+            nu6_2: activation,
+            nu6_3: activation,
+            ..TestBuilder::<(), ()>::DEFAULT_NETWORK
+        };
+        TestBuilder::new()
+            .with_network(network)
+            .with_data_store_factory(TestDbFactory::default())
+            .with_block_cache(BlockCache::new())
+            .with_account_from_sapling_activation(BlockHash([0; 32]))
+            .build()
+    }
+
+    fn add_empty_blocks(st: &mut TestState, count: usize) {
+        for _ in 0..count {
+            let (height, _) = st.generate_empty_block();
+            st.scan_cached_blocks(height, 1);
+        }
+    }
+
+    /// Receives one Ironwood (version 3) note of `value`, then advances the chain so
+    /// the note's shard is scanned and an anchor is available to spend it.
+    fn fund_ironwood(st: &mut TestState, value: u64) {
+        let account_id = st.test_account().unwrap().id();
+        let fvk = IronwoodFvk(OrchardPoolTester::test_account_fvk(st));
+        let value = Zatoshis::const_from_u64(value);
+        let (height, _, _) = st.generate_next_block(&fvk, AddressType::DefaultExternal, value);
+        st.scan_cached_blocks(height, 1);
+        assert_eq!(st.get_total_balance(account_id), value);
+        add_empty_blocks(st, 5);
     }
 
     fn recipient(st: &TestState, pool: &str) -> Address {
@@ -1217,7 +1259,7 @@ mod prepared_tests {
     fn quote(st: &mut TestState, source_pool: &str, destination_pool: &str) -> Result<SendQuote> {
         let recipient = recipient(st, destination_pool);
         let account_id = st.test_account().unwrap().id();
-        let params = *st.wallet().db().params();
+        let params = *st.network();
         RealWallet::quote(
             st.wallet_mut(),
             &params,
@@ -1228,7 +1270,7 @@ mod prepared_tests {
     }
 
     fn fund_transparent(st: &mut TestState, value: u64) {
-        st.add_empty_blocks(10);
+        add_empty_blocks(st, 10);
         let account_id = st.test_account().unwrap().id();
         let taddr = match recipient(st, "transparent") {
             Address::Transparent(address) => address,
@@ -1249,58 +1291,58 @@ mod prepared_tests {
     }
 
     #[test]
-    fn orchard_quote_reports_fee_and_max() {
+    fn ironwood_quote_reports_fee_and_max() {
         let mut st = test_state();
-        st.add_notes_checking_balance([[Zatoshis::const_from_u64(100_000_000)]]);
-        let quote = quote(&mut st, "orchard", "orchard").unwrap();
+        fund_ironwood(&mut st, 100_000_000);
+        let quote = quote(&mut st, "ironwood", "ironwood").unwrap();
         assert_eq!(quote.available_zatoshi, 100_000_000);
         assert_eq!(quote.fee_zatoshi, 10_000);
         assert_eq!(quote.max_zatoshi, 99_990_000);
     }
 
     #[test]
-    fn orchard_quote_max_is_zero_when_balance_only_covers_the_fee() {
+    fn ironwood_quote_max_is_zero_when_balance_only_covers_the_fee() {
         let mut st = test_state();
-        st.add_notes_checking_balance([[Zatoshis::const_from_u64(10_000)]]);
-        let quote = quote(&mut st, "orchard", "orchard").unwrap();
+        fund_ironwood(&mut st, 10_000);
+        let quote = quote(&mut st, "ironwood", "ironwood").unwrap();
         assert_eq!(quote.available_zatoshi, 10_000);
         assert_eq!(quote.fee_zatoshi, 10_000);
         assert_eq!(quote.max_zatoshi, 0);
     }
 
     #[test]
-    fn orchard_quote_max_is_zero_when_balance_is_below_the_fee() {
+    fn ironwood_quote_max_is_zero_when_balance_is_below_the_fee() {
         let mut st = test_state();
-        st.add_notes_checking_balance([[Zatoshis::const_from_u64(9_000)]]);
-        let quote = quote(&mut st, "orchard", "orchard").unwrap();
+        fund_ironwood(&mut st, 9_000);
+        let quote = quote(&mut st, "ironwood", "ironwood").unwrap();
         assert_eq!(quote.available_zatoshi, 9_000);
         assert_eq!(quote.fee_zatoshi, 10_000);
         assert_eq!(quote.max_zatoshi, 0);
     }
 
     #[test]
-    fn orchard_quote_reports_zero_max_for_an_empty_account() {
+    fn ironwood_quote_reports_zero_max_for_an_empty_account() {
         let mut st = test_state();
-        st.add_empty_blocks(10);
-        let quote = quote(&mut st, "orchard", "orchard").unwrap();
+        add_empty_blocks(&mut st, 10);
+        let quote = quote(&mut st, "ironwood", "ironwood").unwrap();
         assert_eq!(quote.available_zatoshi, 0);
         assert_eq!(quote.fee_zatoshi, 10_000);
         assert_eq!(quote.max_zatoshi, 0);
     }
 
-    // ZIP-317: max(⌈148/150⌉, 0) transparent + 2 Orchard actions (recipient,
+    // ZIP-317: max(⌈148/150⌉, 0) transparent + 2 Ironwood actions (recipient,
     // change) = 3 logical actions, above the 2-action grace → 3 × 5_000.
     #[test]
     fn transparent_quote_reports_fee_and_max() {
         let mut st = test_state();
         fund_transparent(&mut st, 100_000_000);
-        let quote = quote(&mut st, "transparent", "orchard").unwrap();
+        let quote = quote(&mut st, "transparent", "ironwood").unwrap();
         assert_eq!(quote.available_zatoshi, 100_000_000);
         assert_eq!(quote.fee_zatoshi, 15_000);
         assert_eq!(quote.max_zatoshi, 99_985_000);
     }
 
-    // ZIP-317: max(⌈148/150⌉, ⌈34/34⌉) transparent + 1 Orchard change action
+    // ZIP-317: max(⌈148/150⌉, ⌈34/34⌉) transparent + 1 Ironwood change action
     // = 2 logical actions, inside the 2-action grace → 2 × 5_000.
     #[test]
     fn transparent_quote_to_transparent_reports_fee_and_max() {
@@ -1316,7 +1358,7 @@ mod prepared_tests {
     fn transparent_quote_max_is_zero_when_balance_is_below_the_fee() {
         let mut st = test_state();
         fund_transparent(&mut st, 9_000);
-        let quote = quote(&mut st, "transparent", "orchard").unwrap();
+        let quote = quote(&mut st, "transparent", "ironwood").unwrap();
         assert_eq!(quote.available_zatoshi, 9_000);
         assert_eq!(quote.fee_zatoshi, 15_000);
         assert_eq!(quote.max_zatoshi, 0);
@@ -1326,9 +1368,9 @@ mod prepared_tests {
     fn transparent_quote_reports_zero_max_for_dust() {
         let mut st = test_state();
         fund_transparent(&mut st, 5_000);
-        let quote = quote(&mut st, "transparent", "orchard").unwrap();
+        let quote = quote(&mut st, "transparent", "ironwood").unwrap();
         assert_eq!(quote.available_zatoshi, 0);
-        // No spendable input, so only the two Orchard actions pay: the
+        // No spendable input, so only the two Ironwood actions pay: the
         // 2-action grace floor still applies once an input exists.
         assert_eq!(quote.fee_zatoshi, 10_000);
         assert_eq!(quote.max_zatoshi, 0);

@@ -136,4 +136,23 @@ describe('TransactionDetail', () => {
     expect(await screen.findByText('Only the fee is public')).toBeInTheDocument();
     expect(screen.queryByText(/Fully transparent/i)).not.toBeInTheDocument();
   });
+
+  it('shows an Ironwood transfer as shielded, not fully transparent', async () => {
+    // After NU6.3 every shielded send is an Ironwood bundle with an empty
+    // Orchard bundle; counting only Orchard labelled it fully transparent.
+    renderTx({
+      txid: TXID,
+      version: 6,
+      vin: [],
+      vout: [],
+      vShieldedSpend: [],
+      vShieldedOutput: [],
+      orchard: { actions: [], valueBalanceZat: 0 },
+      ironwood: { actions: [{}, {}], valueBalanceZat: 10_000 },
+    });
+
+    expect(await screen.findByText('Only the fee is public')).toBeInTheDocument();
+    expect(screen.getByText(/stay inside 2 Ironwood actions/)).toBeInTheDocument();
+    expect(screen.queryByText(/Fully transparent/i)).not.toBeInTheDocument();
+  });
 });

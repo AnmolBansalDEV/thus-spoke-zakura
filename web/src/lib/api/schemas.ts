@@ -16,7 +16,7 @@ const zatoshi = z
   .nonnegative()
   .transform((value) => BigInt(value));
 
-export const poolSchema = z.enum(['transparent', 'orchard']);
+export const poolSchema = z.enum(['transparent', 'ironwood']);
 export type Pool = z.infer<typeof poolSchema>;
 
 export const accountSchema = z.object({
@@ -26,7 +26,9 @@ export const accountSchema = z.object({
   transparent_address: z.string(),
   unified_full_viewing_key: z.string().optional(),
   transparent_zatoshi: zatoshi,
-  orchard_zatoshi: zatoshi,
+  // Servers from before NU6.3 activation report no Ironwood balance (only an
+  // `orchard_zatoshi`, which is dropped here: Orchard can't hold funds on this chain).
+  ironwood_zatoshi: zatoshi.default(0n),
 });
 export type Account = z.infer<typeof accountSchema>;
 
@@ -165,6 +167,17 @@ export const transactionSchema = z.looseObject({
        * Net value moving in or out of the Orchard pool. This is public chain
        * data (ZIP 224), and on an otherwise shielded transfer it is the fee.
        */
+      valueBalanceZat: z.number().optional(),
+    })
+    .optional(),
+  /**
+   * The Ironwood bundle (NU6.3). Once NU6.3 is active every new shielded
+   * output is an Ironwood action, and its value balance is public like
+   * Orchard's.
+   */
+  ironwood: z
+    .looseObject({
+      actions: z.array(z.unknown()).default([]),
       valueBalanceZat: z.number().optional(),
     })
     .optional(),
