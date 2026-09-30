@@ -998,6 +998,7 @@ pub enum RecoveryPhase {
     AutoMine,
     DirectMine,
     Recovery,
+    Faucet,
     Cleanup,
 }
 
@@ -1009,6 +1010,7 @@ impl RecoveryPhase {
             Self::AutoMine => "auto-mine",
             Self::DirectMine => "direct-mine",
             Self::Recovery => "recovery",
+            Self::Faucet => "faucet",
             Self::Cleanup => "cleanup",
         }
     }

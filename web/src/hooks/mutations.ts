@@ -4,7 +4,7 @@ import { queryKeys } from './queries';
 
 /** Everything a successful money movement invalidates. */
 function walletKeys() {
-  return [[...queryKeys.accounts], ['activity'], [...queryKeys.status], ['blocks']];
+  return [[...queryKeys.accounts], ['activity'], [...queryKeys.status], ['blocks'], ['send-quote']];
 }
 
 function useInvalidateWallet() {
@@ -24,6 +24,7 @@ export interface SendVariables {
   source_pool: Pool;
   destination_pool: Pool;
   amount_zatoshi: bigint;
+  memo?: string;
 }
 
 export function useSend(): UseMutationResult<Activity, Error, SendVariables> {

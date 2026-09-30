@@ -15,13 +15,20 @@ use tokio::sync::Mutex;
 
 use support::{
     FailureRoute, GenerateCounts, HeightCheckpoint, RecoveryFailureReporter, RecoveryPhase,
-    RegtestStack, TerminationSignals, request_json, rpc,
+    RegtestStack, TerminationSignals, request_json, rpc, rpc_with_timeout,
 };
 
 const RECOVERY_IDEMPOTENCY_KEY: &str = "recovery-after-auto-mine-failure";
 const RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const API_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const SEND_TIMEOUT: Duration = Duration::from_secs(120);
+const LARGE_MINE_TIMEOUT: Duration = Duration::from_secs(3600);
+
+#[derive(Clone, Copy)]
+enum LiveScenario {
+    BroadcastRecovery,
+    TreasurySync,
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 struct Activity {
@@ -64,6 +71,16 @@ struct SyncStatus {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Docker and prepared regtest images"]
 async fn broadcast_recovers_after_auto_mine_failure() -> Result<()> {
+    run_live_scenario(LiveScenario::BroadcastRecovery).await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Docker and prepared regtest images"]
+async fn large_reward_history_keeps_treasury_faucet_responsive() -> Result<()> {
+    run_live_scenario(LiveScenario::TreasurySync).await
+}
+
+async fn run_live_scenario(live_scenario: LiveScenario) -> Result<()> {
     let reporter = Arc::new(Mutex::new(RecoveryFailureReporter::new()));
     let mut signals = match TerminationSignals::install() {
         Ok(signals) => signals,
@@ -89,7 +106,10 @@ async fn broadcast_recovers_after_auto_mine_failure() -> Result<()> {
         let mut reporter = scenario_reporter.lock().await;
         fixture.start().await?;
         fixture.assert_running().await?;
-        exercise_recovery(&mut fixture, &mut reporter).await
+        match live_scenario {
+            LiveScenario::BroadcastRecovery => exercise_recovery(&mut fixture, &mut reporter).await,
+            LiveScenario::TreasurySync => exercise_treasury_sync(&mut fixture, &mut reporter).await,
+        }
     });
 
     let (scenario_result, route) = tokio::select! {
@@ -132,6 +152,142 @@ async fn broadcast_recovers_after_auto_mine_failure() -> Result<()> {
         );
     }
     result
+}
+
+async fn exercise_treasury_sync(
+    fixture: &mut RegtestStack,
+    reporter: &mut RecoveryFailureReporter,
+) -> Result<()> {
+    let client = Client::new();
+    let before: ChainInfo =
+        rpc(&client, fixture.node_url(), "getblockchaininfo", json!([])).await?;
+
+    reporter.phase(RecoveryPhase::DirectMine);
+    let _: Vec<String> = rpc_with_timeout(
+        &client,
+        fixture.node_url(),
+        "generate",
+        json!([10_000]),
+        LARGE_MINE_TIMEOUT,
+    )
+    .await?;
+    let bulk_tip: ChainInfo =
+        rpc(&client, fixture.node_url(), "getblockchaininfo", json!([])).await?;
+    anyhow::ensure!(
+        bulk_tip.blocks == before.blocks + 10_000,
+        "direct mining did not create the expected reward history"
+    );
+    reporter.record_height(HeightCheckpoint::Tip, bulk_tip.blocks);
+
+    reporter.phase(RecoveryPhase::Recovery);
+    wait_for_wallet_height(fixture, reporter, bulk_tip.blocks, LARGE_MINE_TIMEOUT).await?;
+
+    // An additional block tests refresh cost after the large reward history exists.
+    let _: Vec<String> = rpc(&client, fixture.node_url(), "generate", json!([1])).await?;
+    let incremental_tip: ChainInfo =
+        rpc(&client, fixture.node_url(), "getblockchaininfo", json!([])).await?;
+    anyhow::ensure!(
+        incremental_tip.blocks == bulk_tip.blocks + 1,
+        "incremental mining did not advance the chain by one block"
+    );
+    reporter.record_height(HeightCheckpoint::Tip, incremental_tip.blocks);
+    wait_for_wallet_height(fixture, reporter, incremental_tip.blocks, SEND_TIMEOUT).await?;
+
+    reporter.phase(RecoveryPhase::Faucet);
+    let accounts: Vec<serde_json::Value> = request_json(
+        &client,
+        fixture.api_url(),
+        "/api/v1/accounts",
+        None,
+        API_READ_TIMEOUT,
+    )
+    .await?;
+    anyhow::ensure!(
+        accounts.len() == 5
+            && accounts.iter().all(|account| {
+                account["id"]
+                    .as_u64()
+                    .is_some_and(|id| (1..=5).contains(&id))
+            }),
+        "treasury appeared in public accounts"
+    );
+    let initial_balance = accounts
+        .iter()
+        .find(|account| account["id"] == 2)
+        .and_then(|account| account["orchard_zatoshi"].as_u64())
+        .ok_or_else(|| anyhow::anyhow!("destination balance was missing"))?;
+    for request in 0..10 {
+        let payment: Activity = request_json(
+            &client,
+            fixture.api_url(),
+            "/api/v1/faucet",
+            Some(&json!({
+                "account_id": 2,
+                "pool": "orchard",
+                "amount_zatoshi": 500_000_000u64,
+                "idempotency_key": format!("treasury-history-faucet-{request}"),
+            })),
+            SEND_TIMEOUT,
+        )
+        .await?;
+        anyhow::ensure!(
+            payment.status == "confirmed" && payment.amount_zatoshi == 500_000_000,
+            "faucet payment did not confirm after large reward history"
+        );
+    }
+    let accounts: Vec<serde_json::Value> = request_json(
+        &client,
+        fixture.api_url(),
+        "/api/v1/accounts",
+        None,
+        API_READ_TIMEOUT,
+    )
+    .await?;
+    let final_balance = accounts
+        .iter()
+        .find(|account| account["id"] == 2)
+        .and_then(|account| account["orchard_zatoshi"].as_u64())
+        .ok_or_else(|| anyhow::anyhow!("final destination balance was missing"))?;
+    anyhow::ensure!(
+        final_balance == initial_balance + 5_000_000_000,
+        "faucet did not deliver ten maximum payments"
+    );
+    Ok(())
+}
+
+async fn wait_for_wallet_height(
+    fixture: &mut RegtestStack,
+    reporter: &mut RecoveryFailureReporter,
+    height: u64,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = match fixture
+            .recovery_read::<Status>(deadline, "/api/v1/status")
+            .await
+        {
+            Ok(status) => status,
+            Err(error) if support::is_retryable_read_transport(&error) => {
+                tokio::time::sleep(RECOVERY_POLL_INTERVAL).await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(scanned) = status.wallet_sync.fully_scanned_height {
+            reporter.record_height(HeightCheckpoint::Scanned, scanned);
+        }
+        if status.wallet_sync.state == "ready"
+            && status.wallet_sync.fully_scanned_height == Some(height)
+        {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "wallet did not converge after direct mining"
+        );
+        tokio::time::sleep(RECOVERY_POLL_INTERVAL).await;
+    }
 }
 
 async fn exercise_recovery(
