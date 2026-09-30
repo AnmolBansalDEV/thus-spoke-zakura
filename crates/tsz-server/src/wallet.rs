@@ -7,9 +7,9 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 use zcash_client_backend::{
     data_api::{
-        Account as _, AccountBirthday, CoinbaseFilter, InputSource, MaxSpendMode, TargetValue, WalletCommitmentTrees,
-        WalletRead, WalletWrite,
-        chain::{BlockCache, BlockSource, CommitmentTreeRoot, ChainState, error, scan_cached_blocks},
+        Account as _, AccountBirthday, CoinbaseFilter, InputSource, MaxSpendMode, TargetValue,
+        WalletCommitmentTrees, WalletRead, WalletWrite,
+        chain::{BlockSource, ChainState, CommitmentTreeRoot, error, scan_cached_blocks},
         error::Error as WalletError,
         scanning::ScanRange,
         wallet::{
@@ -25,7 +25,6 @@ use zcash_client_backend::{
     },
     fees::{DustOutputPolicy, StandardFeeRule, standard::SingleOutputChangeStrategy},
     proposal::Proposal,
-    proto::service::compact_tx_streamer_client::CompactTxStreamerClient,
     proto::{
         compact_formats::CompactBlock,
         service::{ChainSpec, RawTransaction, compact_tx_streamer_client::CompactTxStreamerClient},
@@ -139,6 +138,28 @@ pub struct RealWallet {
     db: Arc<Mutex<Db>>,
     account_ids: Vec<AccountUuid>,
     lightwalletd: String,
+}
+
+/// Database capabilities the send proposal paths share; a single bound keeps
+/// `propose_send` and `quote` from drifting apart.
+trait ProposalDb:
+    WalletWrite
+    + InputSource<Error = <Self as WalletRead>::Error, NoteRef: Copy + Eq + Ord + std::fmt::Display>
+    + WalletRead<
+        AccountId = <Self as InputSource>::AccountId,
+        Error: std::error::Error + Send + Sync + 'static,
+    >
+{
+}
+
+impl<T> ProposalDb for T
+where
+    T: WalletWrite
+        + InputSource<Error = <T as WalletRead>::Error>
+        + WalletRead<AccountId = <T as InputSource>::AccountId>,
+    <T as InputSource>::NoteRef: Copy + Eq + Ord + std::fmt::Display,
+    <T as WalletRead>::Error: std::error::Error + Send + Sync + 'static,
+{
 }
 
 struct MemoryBlockCache(BTreeMap<u32, CompactBlock>);
@@ -496,13 +517,14 @@ impl RealWallet {
     }
 
     /// Builds the proposal a send would use, without signing or broadcasting.
-        fn propose_send<DbT>(
+    fn propose_send<DbT>(
         db: &mut DbT,
         params: &LocalNetwork,
         account_id: <DbT as InputSource>::AccountId,
         source_pool: &str,
         recipient: &Address,
         amount: Zatoshis,
+        memo: Option<MemoBytes>,
     ) -> Result<Proposal<StandardFeeRule, <DbT as InputSource>::NoteRef>>
     where
         DbT: ProposalDb,
@@ -511,7 +533,7 @@ impl RealWallet {
             let request = TransactionRequest::new(vec![Payment::new(
                 recipient.to_zcash_address(params),
                 Some(amount),
-                None,
+                memo,
                 None,
                 None,
                 vec![],
@@ -546,7 +568,7 @@ impl RealWallet {
                 ConfirmationsPolicy::MIN,
                 recipient,
                 amount,
-                None,
+                memo,
                 None,
                 ShieldedPool::Orchard,
                 None,
@@ -563,27 +585,10 @@ impl RealWallet {
                 available: u64::from(available),
                 required: u64::from(required),
             }),
+            WalletError::ScanRequired => anyhow::Error::new(PaymentError::ScanRequired),
             error => anyhow::anyhow!("proposing {source_pool} transaction: {error}"),
         })?;
         Ok(proposal)
-    }
-
-    fn send_input(
-        &self,
-        from_account: u8,
-        destination: &str,
-    ) -> Result<(u8, AccountUuid, LocalNetwork, Address)> {
-        let account_index = from_account
-            .checked_sub(1)
-            .context("invalid source account")?;
-        let account_id = *self
-            .account_ids
-            .get(account_index as usize)
-            .context("source account does not exist")?;
-        let params = regtest_network();
-        let recipient =
-            Address::decode(&params, destination).context("invalid destination address")?;
-        Ok((account_index, account_id, params, recipient))
     }
 
     fn send_input(
@@ -611,9 +616,13 @@ impl RealWallet {
         source_pool: &str,
         destination: &str,
         amount: u64,
+        memo: Option<MemoBytes>,
     ) -> Result<String> {
         let (account_index, account_id, params, recipient) =
             self.send_input(from_account, destination)?;
+        if memo.is_some() && matches!(recipient, Address::Transparent(_) | Address::Tex(_)) {
+            return Err(PaymentError::TransparentMemo.into());
+        }
         let mut db = self.db.lock().await;
         let amount = Zatoshis::from_u64(amount).map_err(|_| anyhow::anyhow!("invalid amount"))?;
         let proposal = Self::propose_send(
@@ -623,6 +632,7 @@ impl RealWallet {
             source_pool,
             &recipient,
             amount,
+            memo,
         )?;
         let seed = hex::decode(seed_hex)?;
         let usk = UnifiedSpendingKey::from_seed(
@@ -770,6 +780,7 @@ impl RealWallet {
                 source_pool,
                 recipient,
                 Zatoshis::from_u64(probe_amount).map_err(|_| anyhow::anyhow!("invalid amount"))?,
+                None,
             );
             match probe {
                 Err(error) => match error.downcast_ref() {
@@ -1031,6 +1042,10 @@ mod treasury_sync_tests {
 
 #[cfg(test)]
 mod tests {
+    use transparent::{
+        bundle::{OutPoint, TxOut},
+        keys::TransparentKeyScope,
+    };
     use zcash_client_backend::{
         data_api::testing::{
             orchard::OrchardPoolTester,
@@ -1040,10 +1055,6 @@ mod tests {
     };
     use zcash_client_sqlite::testing::{BlockCache, db::TestDbFactory};
     use zcash_keys::keys::UnifiedAddressRequest;
-    use zcash_transparent::{
-        bundle::{OutPoint, TxOut},
-        keys::TransparentKeyScope,
-    };
 
     use super::*;
 

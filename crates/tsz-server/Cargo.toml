@@ -55,4 +55,3 @@ tempfile = "3"
 # The wallet SDK's in-memory chain/scanner harness for proposal-level tests.
 zcash_client_backend = { package = "zakura-client-backend", version = "=0.1.0-rc5", features = ["test-dependencies"] }
 zcash_client_sqlite = { package = "zakura-client-sqlite", version = "=0.1.0-rc5", features = ["test-dependencies"] }
-zcash_transparent = "=0.10.0"

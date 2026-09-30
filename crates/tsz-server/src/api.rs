@@ -28,8 +28,8 @@ use zcash_protocol::{consensus::COINBASE_MATURITY_BLOCKS, memo::MemoBytes, value
 
 use crate::{
     db::{Account, Activity, Store, TREASURY_ACCOUNT_ID, USER_ACCOUNT_COUNT, ZATOSHIS_PER_ZEC},
-    rpc::{ChainInfo, NodeRpc},
-    wallet::{PaymentError, RealWallet, WALLET_BIRTHDAY_HEIGHT, SendQuote, regtest_network},
+    rpc::{ChainCheckpoint, ChainInfo, NodeRpc},
+    wallet::{PaymentError, RealWallet, SendQuote, WALLET_BIRTHDAY_HEIGHT, regtest_network},
 };
 
 #[derive(Clone)]
@@ -1988,7 +1988,6 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
     struct RecordingFaucetRuntime {
         events: Mutex<Vec<String>>,
         funds_available: AtomicBool,
