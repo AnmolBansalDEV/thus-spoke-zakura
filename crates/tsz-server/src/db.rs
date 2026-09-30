@@ -5,7 +5,6 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use bip39::Mnemonic;
-use rand::RngCore;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use uuid::Uuid;
@@ -22,6 +21,12 @@ pub const TREASURY_ACCOUNT_ID: u8 = 6;
 #[derive(Debug, thiserror::Error)]
 #[error("idempotency key was already used for a different payment")]
 pub struct IdempotencyConflict;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreasuryCursor {
+    pub receiver: String,
+    pub height: u32,
+    pub block_hash: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Account {
@@ -94,12 +99,23 @@ impl Store {
                 txid TEXT NOT NULL, block_hash TEXT, status TEXT NOT NULL,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
-            CREATE TABLE IF NOT EXISTS idempotency (key TEXT PRIMARY KEY, activity_id TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS idempotency (
+                key TEXT PRIMARY KEY, activity_id TEXT NOT NULL, memo TEXT
+            );
             CREATE TABLE IF NOT EXISTS prepared_payments (
                 activity_id TEXT PRIMARY KEY, raw_transaction BLOB NOT NULL,
                 expiry_height INTEGER NOT NULL
             );
         "#)?;
+        let has_memo = db
+            .prepare("PRAGMA table_info(idempotency)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .iter()
+            .any(|column| column == "memo");
+        if !has_memo {
+            db.execute("ALTER TABLE idempotency ADD COLUMN memo TEXT", [])?;
+        }
         let stored_seed = db
             .query_row("SELECT value FROM metadata WHERE key='seed'", [], |r| {
                 r.get::<_, String>(0)
@@ -108,8 +124,7 @@ impl Store {
         let seed = if let Some(seed) = stored_seed {
             hex::decode(seed).context("invalid wallet seed")?
         } else {
-            let mut entropy = [0u8; 32];
-            rand::rng().fill_bytes(&mut entropy);
+            let entropy = [0u8; 32];
             let mnemonic = Mnemonic::from_entropy(&entropy)
                 .context("encoding wallet entropy as a BIP-39 mnemonic")?;
             let seed = mnemonic.to_seed("");
@@ -149,6 +164,7 @@ impl Store {
         Ok(accounts)
     }
 
+    #[cfg(test)]
     pub fn user_accounts(&self) -> Result<Vec<Account>> {
         Ok(self
             .accounts()?
@@ -191,6 +207,7 @@ impl Store {
         destination_pool: &str,
         amount: u64,
         key: &str,
+        memo: Option<&str>,
     ) -> Result<Activity> {
         validate_pool(source_pool)?;
         validate_pool(destination_pool)?;
@@ -208,6 +225,13 @@ impl Store {
                 destination_pool,
                 amount,
             )?;
+            let saved_memo: Option<String> =
+                db.query_row("SELECT memo FROM idempotency WHERE key=?1", [key], |row| {
+                    row.get(0)
+                })?;
+            if saved_memo.as_deref() != memo {
+                return Err(IdempotencyConflict.into());
+            }
             return Ok(activity);
         }
         for id in [from, to] {
@@ -228,7 +252,7 @@ impl Store {
             destination_pool,
             amount,
         );
-        insert_activity(&tx, &activity, key)?;
+        insert_activity(&tx, &activity, key, memo)?;
         tx.commit()?;
         Ok(activity)
     }
@@ -252,7 +276,7 @@ impl Store {
         }
         let tx = db.transaction()?;
         let activity = new_activity("faucet", None, to, "orchard", pool, amount);
-        insert_activity(&tx, &activity, key)?;
+        insert_activity(&tx, &activity, key, None)?;
         tx.commit()?;
         Ok(activity)
     }
@@ -409,11 +433,11 @@ impl Store {
     }
 }
 
-fn insert_activity(db: &Connection, a: &Activity, key: &str) -> Result<()> {
+fn insert_activity(db: &Connection, a: &Activity, key: &str, memo: Option<&str>) -> Result<()> {
     db.execute("INSERT INTO activity(id,kind,from_account,to_account,source_pool,destination_pool,amount_zatoshi,txid,status) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)", params![a.id,a.kind,a.from_account,a.to_account,a.source_pool,a.destination_pool,a.amount_zatoshi,a.txid,a.status])?;
     db.execute(
-        "INSERT INTO idempotency(key,activity_id) VALUES(?1,?2)",
-        params![key, a.id],
+        "INSERT INTO idempotency(key,activity_id,memo) VALUES(?1,?2,?3)",
+        params![key, a.id, memo],
     )?;
     Ok(())
 }
@@ -576,6 +600,22 @@ mod tests {
         assert_eq!(store.account(2).unwrap().orchard_zatoshi, 0);
     }
     #[test]
+    fn fresh_stores_derive_the_same_development_accounts() {
+        let first = Store::open(":memory:").unwrap();
+        first.initialize().unwrap();
+        let second = Store::open(":memory:").unwrap();
+        second.initialize().unwrap();
+        assert_eq!(first.accounts().unwrap(), second.accounts().unwrap());
+        assert_eq!(
+            first.mnemonic().unwrap(),
+            format!("{}art", "abandon ".repeat(23))
+        );
+        assert_eq!(
+            first.account(1).unwrap().transparent_address,
+            "tmBsTi2xWTjUdEXnuTceL7fecEQKeWaPDJd"
+        );
+    }
+    #[test]
     fn restores_the_hidden_treasury_for_existing_stores() {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
@@ -712,7 +752,7 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let activity = store
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "send")
+            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "send", None)
             .unwrap();
         let activity = store
             .record_prepared(&activity.id, "real-txid", b"raw transaction", 140)
@@ -727,17 +767,17 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         store
-            .claim_transfer(1, 2, "orchard", "orchard", 11_000, "preparing-key")
+            .claim_transfer(1, 2, "orchard", "orchard", 11_000, "preparing-key", None)
             .unwrap();
         let pending = store
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "pending-key")
+            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "pending-key", None)
             .unwrap();
         let pending = store
             .record_prepared(&pending.id, "txid-pending", b"pending", 140)
             .unwrap();
         let pending = store.mark_broadcast(&pending.id, &pending.txid).unwrap();
         let mined = store
-            .claim_transfer(1, 3, "orchard", "orchard", 13_000, "mined-key")
+            .claim_transfer(1, 3, "orchard", "orchard", 13_000, "mined-key", None)
             .unwrap();
         let mined = store
             .record_prepared(&mined.id, "txid-mined", b"mined", 140)
@@ -759,7 +799,7 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let pending = store
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "empty-hash")
+            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "empty-hash", None)
             .unwrap();
         let pending = store
             .record_prepared(&pending.id, "txid-empty", b"raw", 140)
@@ -768,7 +808,7 @@ mod tests {
 
         assert!(store.confirm(&pending.id, &pending.txid, "").is_err());
         let again = store
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "empty-hash")
+            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "empty-hash", None)
             .unwrap();
         assert_eq!(again.id, pending.id);
         assert_eq!(again.status, "broadcast");
@@ -780,11 +820,11 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         store
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same")
+            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same", None)
             .unwrap();
 
         let error = store
-            .claim_transfer(1, 2, "orchard", "orchard", 13_000, "same")
+            .claim_transfer(1, 2, "orchard", "orchard", 13_000, "same", None)
             .unwrap_err();
 
         assert!(error.to_string().contains("different payment"));
@@ -794,6 +834,58 @@ mod tests {
             .claim_faucet(2, "orchard", 12_000, "same")
             .unwrap_err();
         assert!(error.downcast_ref::<IdempotencyConflict>().is_some());
+    }
+
+    #[test]
+    fn memo_is_part_of_the_claimed_payment() {
+        let store = Store::open(":memory:").unwrap();
+        store.initialize().unwrap();
+        let first = store
+            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "memo-key", Some("rent"))
+            .unwrap();
+        assert_eq!(
+            store
+                .claim_transfer(1, 2, "orchard", "orchard", 12_000, "memo-key", Some("rent"))
+                .unwrap()
+                .id,
+            first.id
+        );
+        for memo in [None, Some(""), Some("gift")] {
+            let error = store
+                .claim_transfer(1, 2, "orchard", "orchard", 12_000, "memo-key", memo)
+                .unwrap_err();
+            assert!(error.downcast_ref::<IdempotencyConflict>().is_some());
+        }
+    }
+
+    #[test]
+    fn existing_idempotency_tables_gain_a_memo_column() {
+        let store = Store::open(":memory:").unwrap();
+        store
+            .0
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE idempotency (key TEXT PRIMARY KEY, activity_id TEXT NOT NULL)",
+            )
+            .unwrap();
+        store.initialize().unwrap();
+        store
+            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "memo-key", Some("rent"))
+            .unwrap();
+        assert_eq!(
+            store
+                .0
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT memo FROM idempotency WHERE key='memo-key'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "rent"
+        );
     }
 
     #[test]
@@ -808,7 +900,7 @@ mod tests {
                 std::thread::spawn(move || {
                     barrier.wait();
                     store
-                        .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same")
+                        .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same", None)
                         .unwrap()
                 })
             })
@@ -828,14 +920,14 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let failed = store
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same")
+            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same", None)
             .unwrap();
 
         store.discard_preparing(&failed.id).unwrap();
 
         assert!(store.activity_for_key("same").unwrap().is_none());
         let retry = store
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same")
+            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same", None)
             .unwrap();
         assert_ne!(retry.id, failed.id);
     }
@@ -845,7 +937,7 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let claim = store
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same")
+            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same", None)
             .unwrap();
         store
             .record_prepared(&claim.id, "expired-txid", b"signed transaction", 140)
@@ -864,7 +956,7 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let claim = store
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same")
+            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same", None)
             .unwrap();
         let first = store
             .record_prepared(&claim.id, "real-txid", b"signed transaction", 140)
@@ -884,7 +976,7 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let claim = store
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same")
+            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same", None)
             .unwrap();
         let prepared = store
             .record_prepared(&claim.id, "real-txid", b"signed transaction", 140)
@@ -920,7 +1012,7 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let claim = store
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same")
+            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same", None)
             .unwrap();
         store
             .record_prepared(&claim.id, "old-txid", b"old transaction", 140)
@@ -941,7 +1033,7 @@ mod tests {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let claim = store
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same")
+            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same", None)
             .unwrap();
         store
             .record_prepared(&claim.id, "real-txid", b"transaction", 140)
@@ -963,7 +1055,7 @@ mod tests {
         let store = Store::open(&path).unwrap();
         store.initialize().unwrap();
         let claim = store
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same")
+            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same", None)
             .unwrap();
         let id = claim.id.clone();
         store
@@ -974,7 +1066,7 @@ mod tests {
         let reopened = Store::open(path).unwrap();
         reopened.initialize().unwrap();
         let recovered = reopened
-            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same")
+            .claim_transfer(1, 2, "orchard", "orchard", 12_000, "same", None)
             .unwrap();
 
         assert_eq!(recovered.txid, "real-txid");

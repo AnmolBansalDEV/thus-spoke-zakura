@@ -28,10 +28,10 @@ pub struct ChainInfo {
     pub verificationprogress: f64,
 }
 
-#[derive(Debug, Deserialize)]
-struct Envelope<T> {
-    result: Option<T>,
-    error: Option<RpcError>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChainCheckpoint {
+    pub height: u64,
+    pub hash: String,
 }
 
 #[derive(Debug, Deserialize, thiserror::Error)]
@@ -77,20 +77,23 @@ impl NodeRpc {
                 anyhow::Error::new(error).context(context)
             })?;
         let status = response.status();
-        let envelope: Envelope<T> = response.json().await.context("decoding Zakura response")?;
-        if let Some(error) = envelope.error {
-            return Err(error).with_context(|| format!("Zakura {method} failed"));
-        }
-        if !status.is_success() {
-            bail!("Zakura {method} returned HTTP {status}");
-        }
-        envelope
-            .result
-            .context("Zakura response did not contain a result")
+        let envelope: Value = response.json().await.context("decoding Zakura response")?;
+        classify_response(status, method, envelope)
     }
 
     pub async fn chain_info(&self) -> Result<ChainInfo> {
         self.call("getblockchaininfo", json!([])).await
+    }
+    pub async fn checkpoint(&self) -> Result<ChainCheckpoint> {
+        let info = self.chain_info().await?;
+        anyhow::ensure!(
+            info.bestblockhash.len() == 64,
+            "Zakura returned an invalid best block hash"
+        );
+        Ok(ChainCheckpoint {
+            height: info.blocks,
+            hash: info.bestblockhash,
+        })
     }
     pub async fn generate(&self, blocks: u32) -> Result<Vec<String>> {
         self.call_within(GENERATE_TIMEOUT, "generate", json!([blocks]))
@@ -99,15 +102,30 @@ impl NodeRpc {
     pub async fn block(&self, id: &str) -> Result<Value> {
         self.call("getblock", json!([id, 2])).await
     }
+    pub async fn block_hash(&self, height: u32) -> Result<String> {
+        self.call("getblockhash", json!([height])).await
+    }
+    pub async fn unspent_output(&self, txid: &str, index: u32) -> Result<Option<Value>> {
+        self.call("gettxout", json!([txid, index, true])).await
+    }
     pub async fn transaction(&self, txid: &str) -> Result<Value> {
         self.call("getrawtransaction", json!([txid, 1])).await
     }
-    pub async fn transaction_known(&self, txid: &str) -> Result<bool> {
+    pub async fn lookup_transaction(&self, txid: &str) -> Result<Option<Value>> {
         match self.transaction(txid).await {
-            Ok(_) => Ok(true),
-            Err(error) if transaction_missing(&error) => Ok(false),
+            Ok(transaction) => {
+                anyhow::ensure!(
+                    transaction.get("txid").and_then(Value::as_str) == Some(txid),
+                    "Zakura returned a mismatched transaction id"
+                );
+                Ok(Some(transaction))
+            }
+            Err(error) if transaction_missing(&error) => Ok(None),
             Err(error) => Err(error),
         }
+    }
+    pub async fn transaction_known(&self, txid: &str) -> Result<bool> {
+        Ok(self.lookup_transaction(txid).await?.is_some())
     }
     pub async fn mempool(&self) -> Result<Vec<String>> {
         self.call("getrawmempool", json!([])).await
@@ -118,6 +136,25 @@ fn transaction_missing(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<RpcError>()
         .is_some_and(|error| error.code == -5)
+}
+
+fn classify_response<T: DeserializeOwned>(
+    status: reqwest::StatusCode,
+    method: &str,
+    envelope: Value,
+) -> Result<T> {
+    if let Some(error) = envelope.get("error").filter(|error| !error.is_null()) {
+        let error: RpcError =
+            serde_json::from_value(error.clone()).context("decoding Zakura RPC error")?;
+        return Err(error).with_context(|| format!("Zakura {method} failed"));
+    }
+    if !status.is_success() {
+        bail!("Zakura {method} returned HTTP {status} without a JSON-RPC error");
+    }
+    let result = envelope
+        .get("result")
+        .with_context(|| format!("Zakura {method} response did not contain a result"))?;
+    serde_json::from_value(result.clone()).context("decoding Zakura result")
 }
 
 #[cfg(test)]

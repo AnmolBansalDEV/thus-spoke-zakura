@@ -8,9 +8,11 @@ import {
   blockSchema,
   mempoolSchema,
   seedSchema,
+  sendQuoteSchema,
   statusSchema,
   transactionSchema,
   type Pool,
+  type SendQuoteInput,
 } from './schemas';
 
 export const api = {
@@ -49,11 +51,15 @@ export const api = {
     destination_pool: Pool;
     amount_zatoshi: bigint;
     idempotency_key: string;
+    memo?: string;
   }) =>
     post('/send', activitySchema, {
       ...input,
       amount_zatoshi: Number(input.amount_zatoshi),
     }),
+
+  /** Dry-run proposal: exact fee and max spendable; nothing is broadcast. */
+  sendQuote: (input: SendQuoteInput) => post('/send/quote', sendQuoteSchema, input),
 
   faucet: (input: {
     account_id: number;

@@ -4,7 +4,7 @@ import { queryKeys } from './queries';
 
 /** Everything a successful money movement invalidates. */
 function walletKeys() {
-  return [[...queryKeys.accounts], ['activity'], [...queryKeys.status], ['blocks']];
+  return [[...queryKeys.accounts], ['activity'], [...queryKeys.status], ['blocks'], ['send-quote']];
 }
 
 function useInvalidateWallet() {
@@ -42,14 +42,20 @@ export interface SendVariables {
   source_pool: Pool;
   destination_pool: Pool;
   amount_zatoshi: bigint;
+  memo?: string;
 }
 
 export function useSend(): UseMutationResult<Activity, Error, SendVariables> {
   const invalidate = useInvalidateWallet();
-  const operation = operationKey(
-    'send',
-    (variables: SendVariables) =>
-      `${variables.from_account}:${variables.to_account}:${variables.source_pool}:${variables.destination_pool}:${variables.amount_zatoshi}`,
+  const operation = operationKey('send', (variables: SendVariables) =>
+    JSON.stringify([
+      variables.from_account,
+      variables.to_account,
+      variables.source_pool,
+      variables.destination_pool,
+      variables.amount_zatoshi.toString(),
+      variables.memo ?? null,
+    ]),
   );
   return useMutation({
     mutationFn: (variables: SendVariables) =>
