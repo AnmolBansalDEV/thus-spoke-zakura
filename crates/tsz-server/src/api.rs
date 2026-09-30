@@ -29,7 +29,7 @@ use zcash_protocol::{consensus::COINBASE_MATURITY_BLOCKS, memo::MemoBytes, value
 use crate::{
     db::{Account, Activity, Store, TREASURY_ACCOUNT_ID, USER_ACCOUNT_COUNT, ZATOSHIS_PER_ZEC},
     rpc::{ChainCheckpoint, ChainInfo, NodeRpc},
-    wallet::{PaymentError, RealWallet, WALLET_BIRTHDAY_HEIGHT, regtest_network},
+    wallet::{PaymentError, RealWallet, SendQuote, WALLET_BIRTHDAY_HEIGHT, regtest_network},
 };
 
 #[derive(Clone)]
@@ -273,6 +273,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/accounts", get(accounts))
         .route("/api/v1/activity", get(activity))
         .route("/api/v1/send", post(send))
+        .route("/api/v1/send/quote", post(send_quote))
         .route("/api/v1/faucet", post(faucet))
         .route("/api/v1/faucet/address", post(faucet_address))
         .route("/api/v1/mine", post(mine))
@@ -418,6 +419,36 @@ async fn send(
         &txid,
     )?;
     Ok(Json(confirm_after_mining(&state, pending).await?))
+}
+
+#[derive(Deserialize)]
+struct SendQuoteRequest {
+    from_account: u8,
+    source_pool: String,
+    destination_pool: String,
+}
+async fn send_quote(
+    State(state): State<AppState>,
+    Json(req): Json<SendQuoteRequest>,
+) -> ApiResult<Json<SendQuote>> {
+    require_user_account(req.from_account)?;
+    require_pool(&req.source_pool, "source_pool")?;
+    require_pool(&req.destination_pool, "destination_pool")?;
+    // The fee depends only on the destination's receiver kinds, which every
+    // account shares, so the source account's own address quotes the same fee.
+    let destination = state.0.store.account(req.from_account)?;
+    let address = if req.destination_pool == "transparent" {
+        destination.transparent_address
+    } else {
+        destination.unified_address
+    };
+    Ok(Json(
+        state
+            .0
+            .wallet
+            .send_quote(req.from_account, &req.source_pool, &address)
+            .await?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -1308,6 +1339,7 @@ impl From<anyhow::Error> for ApiError {
         Self {
             status: match error.downcast_ref() {
                 Some(PaymentError::TreasuryExhausted) => StatusCode::SERVICE_UNAVAILABLE,
+                Some(PaymentError::InsufficientFunds { .. }) => StatusCode::UNPROCESSABLE_ENTITY,
                 Some(PaymentError::TransparentMemo) => StatusCode::BAD_REQUEST,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             },
@@ -1905,6 +1937,55 @@ mod tests {
             ApiError::from(anyhow::Error::new(PaymentError::TreasuryExhausted)).status,
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[test]
+    fn an_unaffordable_send_is_reported_as_a_client_error() {
+        assert_eq!(
+            ApiError::from(anyhow::Error::new(PaymentError::InsufficientFunds {
+                available: 100_000_000,
+                required: 100_010_000,
+            }))
+            .status,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    /// An unknown pool is a client error, not the wallet's internal `bail!`
+    /// surfacing as a 500 that the dashboard reports as an unexpected error.
+    #[tokio::test]
+    async fn send_quote_rejects_unknown_pools_as_bad_requests() {
+        let (state, _dir) = state_with_local_wallet();
+        let app = router(state);
+        for (body, message) in [
+            (
+                json!({"from_account": 1, "source_pool": "sapling", "destination_pool": "orchard"}),
+                "source_pool must be transparent or orchard",
+            ),
+            (
+                json!({"from_account": 1, "source_pool": "orchard", "destination_pool": "sapling"}),
+                "destination_pool must be transparent or orchard",
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/v1/send/quote")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&bytes).contains(message),
+                "expected {message} in {bytes:?}"
+            );
+        }
     }
 
     struct RecordingFaucetRuntime {

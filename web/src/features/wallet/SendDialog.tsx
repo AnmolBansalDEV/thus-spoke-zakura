@@ -7,8 +7,9 @@ import { Button } from '@/components/ui/Button';
 import { Field } from '@/components/ui/Field';
 import { useToast } from '@/components/ui/toast-context';
 import { errorMessage, type Account } from '@/lib/api';
-import { formatZecAmount } from '@/lib/money';
+import { formatZec, formatZecAmount } from '@/lib/money';
 import { useSend } from '@/hooks/mutations';
+import { useSendQuote } from '@/hooks/queries';
 import {
   MEMO_MAX_BYTES,
   memoByteLength,
@@ -71,10 +72,24 @@ export function SendDialog({
         ? source.orchard_zatoshi
         : source.transparent_zatoshi;
 
-  const submit = form.handleSubmit((values) => {
+  // The quote is a dry-run proposal, so its fee reflects real input selection.
+  const quote = useSendQuote({
+    from_account: Number(fromAccount),
+    source_pool: sourcePool,
+    destination_pool: destinationPool,
+  });
+
+  const submit = form.handleSubmit(async (values) => {
     if (values.amount > available) {
       form.setError('amount', {
         message: `Account ${values.from_account} holds ${formatZecAmount(available)} in the ${values.source_pool} pool.`,
+      });
+      return;
+    }
+    const quoted = quote.data ?? (await quote.refetch()).data;
+    if (quoted !== undefined && values.amount > quoted.max_zatoshi) {
+      form.setError('amount', {
+        message: `The ${formatZecAmount(quoted.fee_zatoshi)} network fee leaves at most ${formatZecAmount(quoted.max_zatoshi)} spendable — Account ${values.from_account} holds ${formatZecAmount(quoted.available_zatoshi)} in the ${values.source_pool} pool.`,
       });
       return;
     }
@@ -146,17 +161,40 @@ export function SendDialog({
 
         <Field
           label="Amount (ZEC)"
-          hint={`${formatZecAmount(available)} available in the ${sourcePool} pool.`}
+          hint={
+            quote.data !== undefined
+              ? `${formatZecAmount(quote.data.max_zatoshi)} spendable after a ${formatZecAmount(quote.data.fee_zatoshi)} network fee.`
+              : `${formatZecAmount(available)} available in the ${sourcePool} pool.`
+          }
           error={form.formState.errors.amount?.message}
         >
           {(aria) => (
-            <input
-              {...aria}
-              {...form.register('amount')}
-              inputMode="decimal"
-              autoComplete="off"
-              className={controlStyles}
-            />
+            <div className="flex items-stretch gap-2">
+              <input
+                {...aria}
+                {...form.register('amount')}
+                inputMode="decimal"
+                autoComplete="off"
+                className={controlStyles}
+              />
+              <Button
+                type="button"
+                variant="subtle"
+                size="sm"
+                disabled={quote.data === undefined || quote.data.max_zatoshi === 0n}
+                onClick={() => {
+                  const max = quote.data?.max_zatoshi;
+                  if (max === undefined) return;
+                  form.setValue('amount', formatZec(max), {
+                    shouldDirty: true,
+                    shouldValidate: true,
+                  });
+                  form.clearErrors('amount');
+                }}
+              >
+                Max
+              </Button>
+            </div>
           )}
         </Field>
 
