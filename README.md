@@ -109,19 +109,25 @@ details.
 
 ### Connect your own application
 
-The **Network** page shows the live dashboard, Zakura RPC, lightwalletd, and P2P
-addresses. Ports are selected automatically and bound only to `127.0.0.1`.
+The default instance always binds loopback ports:
+
+| Service | URL |
+| --- | --- |
+| Dashboard | `http://127.0.0.1:32805` |
+| Zakura RPC | `http://127.0.0.1:18232` |
+| lightwalletd | `http://127.0.0.1:9067` (Regtest, no TLS) |
+| P2P | `127.0.0.1:18233` |
+
+If a port is already taken, `ths start` exits and names that port. It does not pick a random host port.
 
 ![Network health and runtime endpoints](docs/images/network.png)
-
-You can also print these values in a terminal:
 
 ```console
 ths endpoints
 ths endpoints --json
 ```
 
-Run these commands in a second terminal while the environment is running.
+`endpoints --json` includes `"network": "regtest"` and `"tls": false` for lightwalletd.
 
 ### Use the development accounts
 
@@ -159,6 +165,7 @@ Running `ths` with no command starts the default environment.
 | --- | --- |
 | `ths` | Start a fresh environment and open the dashboard |
 | `ths start --no-open` | Start without opening a browser |
+| `ths start --port-offset 10` | Start on loopback ports shifted by 10 for another instance |
 | `ths status` | Show health and endpoint information |
 | `ths open` | Open the running dashboard |
 | `ths endpoints --json` | Print endpoints for scripts and developer tools |
@@ -194,8 +201,16 @@ ths --name alice mine 10
 ths mine 10 --name alice
 ```
 
-Each named environment gets its own ports and Docker resources. Run each one in
-a separate terminal.
+Each named environment has its own Docker resources. A second instance must
+not reuse the default ports:
+
+```console
+ths --name alice start --port-offset 10
+```
+
+`--port-offset` is a multiple of 10 added to every default host port
+(dashboard 32815, RPC 18242, P2P 18243, lightwalletd 9077). If those binds
+are taken, start fails rather than remapping.
 
 ## Develop from source
 

@@ -38,8 +38,13 @@ wallet, keys, and Docker volumes.
 ```console
 ths
 ths start --no-open      # don't open a browser tab
-ths --name alice         # start a second, independent environment named "alice"
+ths --name alice start --port-offset 10  # start a second, independent environment
 ```
+
+The default loopback ports are dashboard `32805`, Zakura RPC `18232`, P2P
+`18233`, and lightwalletd `9067`. `--port-offset` adds a multiple of 10 to
+each host port (default: `0`). Startup fails and names an occupied port
+instead of selecting a random port.
 
 ### `ths build [--dev]`
 
@@ -86,6 +91,9 @@ scripts and other developer tooling.
 ths endpoints
 ths endpoints --json
 ```
+
+JSON output includes `"network": "regtest"` and `"tls": false`; lightwalletd
+uses plaintext HTTP on loopback.
 
 ### `ths logs [app|zakura|lightwalletd] [-f|--follow]`
 
@@ -336,6 +344,7 @@ account 1 to account 3, all without opening the dashboard.
 | --- | --- |
 | `ths` | Start a fresh environment and open the dashboard |
 | `ths start --no-open` | Start without opening a browser |
+| `ths start --port-offset <N>` | Shift loopback host ports by a multiple of 10 for another instance |
 | `ths build [--dev]` | Build runtime images from source |
 | `ths pull` | Pull the exact images for this launcher version |
 | `ths status [--json]` | Show health and endpoint information |
