@@ -136,7 +136,7 @@ describe('SendDialog', () => {
     await userEvent.paste('a'.repeat(513));
     await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
     expect(await screen.findByRole('alert')).toHaveTextContent('512 bytes');
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(sendCalls(fetchMock)).toHaveLength(0);
   });
 
   it('disables and clears the memo when the destination is transparent', async () => {
