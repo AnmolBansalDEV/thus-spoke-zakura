@@ -64,6 +64,12 @@ needed to confirm it.
 Faucet requests are limited to 5 ZEC. These coins have no value and work only
 inside this local environment.
 
+From a terminal, fund several accounts at once by index:
+
+```console
+ths wallet faucet --accounts 1,2,3 --amount 3
+```
+
 ### Send ZEC between accounts
 
 Select **Send ZEC** or the **Send** button on an account card. Choose the source
@@ -73,7 +79,17 @@ mined automatically and appears under **Recent activity**.
 You can use Orchard or transparent balances to exercise different transaction
 routes.
 
+When the destination pool is Orchard, you can add an optional memo of up to
+512 bytes. It is encrypted to the recipient and never shown in the explorer.
+Transparent outputs cannot carry a memo, so the field is disabled for them.
+
 ![Send ZEC between development accounts](docs/images/send.png)
+
+The same transfer from a terminal:
+
+```console
+ths wallet send --from 1 --to 2 --amount 1 --memo "rent for October"
+```
 
 ### Mine blocks
 
@@ -107,6 +123,34 @@ ths endpoints --json
 
 Run these commands in a second terminal while the environment is running.
 
+### Use the development accounts
+
+Every environment derives its accounts from the same mnemonic, so the account
+addresses are the same on every run. The mnemonic is public; never send real
+funds to these accounts.
+
+```text
+abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art
+```
+
+| Account | Transparent address |
+| --- | --- |
+| 1 | `tmBsTi2xWTjUdEXnuTceL7fecEQKeWaPDJd` |
+| 2 | `tmF3CKFqQ68GdisHK3D9S8pMty7a7Fr2wiN` |
+| 3 | `tmRmiMusmfipcUmWeQ4YUVc6rKtckdd2aV3` |
+| 4 | `tmDGByq79K3SJdCt3aGCTjYquv45Nf3ExaL` |
+| 5 | `tmAsyD1UHXiomo6na1z7b1UtMSpFJArgPv9` |
+
+Unified addresses:
+
+```text
+Account 1: uregtest1zkuzfv5m3yhv2j4fmvq5rjurkxenxyq8r7h4daun2zkznrjaa8ra8asgdm8wwgwjvlwwrxx7347r8w0ee6dqyw4rufw4wg9djwcr6frzkezmdw6dud3wsm99eany5r8wgsctlxquu009nzd6hsme2tcsk0v3sgjvxa70er7h27z5epr67p5q767s2z5gt88paru56mxpm6pwz0cu35m
+Account 2: uregtest1fglg8gvt5luptyqvrx0u52yam4cru63skg9s0sa6zth72hachgyhwm8e7p9vy2vcatws7wvzfhnrqte4nwrff7tju4dv35gdn4h8ekarqyeqlk5gpmm5zlphzls960xe20cajd0k4vcvm2j8sekz77f864sgedncru8u8ruz8gvnpuxvnk7qcyszj7jg5n7nqqqfswh736c2kt4s7ad
+Account 3: uregtest1m3cll7nlzq6dyrgpfvw22xcrvkq4x4y79q6wekj9t24dh6khunpu0gw7u80tlz047gwmr54qvhllq4ad4vm5qrxjlr997l3egt4scs3fg578stzue3u68rte0y76gy43kmvgvaj0jcmkewpa86w9ml2ph2wg9cd2mnwr272y8eggtvhsrxeeykx04hksanha3qmvhrf0v2c52fxyaue
+Account 4: uregtest1549x97unhklahphm9rzvf9dl6fm8nnpw8upggjnet7090sf994wm8crdnv8ul4h4jwy07hdt9ns59307um2gqzzpfssphtwjj4053ykgc4w2kczq4u9gxg9t08eg8d7gj90wp84v34wyurfhvu4zpmrkl9le2m04jcletuwvwa52a9fj90v3wulh32yhldr84uwr4j47z3w55w2899r
+Account 5: uregtest1l82ktar6wygqsncxp7famz8manh48tv283pve29fnumsrskyj9dyhn50l9gntm9k524cjq5xxm0zr7qwsspcmtrm5jlc7tqww60p9uvd8dke3sah86yzkj4rakhkpp0um6n08dxg50jv4pxnf3stenmyeyzqm0746g87sjh6kd328d0jetnwgktkuhjsfnhca5s9stselz02q52zvcj
+```
+
 ## Useful commands
 
 Running `ths` with no command starts the default environment.
@@ -121,6 +165,10 @@ Running `ths` with no command starts the default environment.
 | `ths mine 10` | Mine blocks on the running environment and synchronize its wallet |
 | `ths faucet <ADDRESS>` | Send 1 disposable ZEC to a Regtest unified or transparent address |
 | `ths faucet <ADDRESS> --amount 2.5` | Send a custom amount of up to 5 disposable ZEC |
+| `ths wallet faucet --accounts 1,2,3 --amount 3` | Fund development accounts by index from the treasury |
+| `ths wallet send --from 1 --to 2 --amount 1 --memo "hi"` | Send between development accounts, with an optional Orchard memo |
+| `ths wallet shield --from 1 --to 2 --amount 0.5` | Spend transparent funds into another account's Orchard balance |
+| `ths wallet unshield --from 1 --to 2 --amount 0.2` | Spend Orchard funds into another account's transparent balance |
 | `ths logs app -f` | Follow dashboard/server logs |
 | `ths logs zakura -f` | Follow node logs |
 | `ths logs lightwalletd -f` | Follow lightwalletd logs |
@@ -132,6 +180,10 @@ Running `ths` with no command starts the default environment.
 | `ths update --check` | Check for a newer release |
 | `ths update` | Install the latest verified release |
 | `ths uninstall` | Remove the installed launcher executable |
+
+Everything under `ths wallet` acts on the development wallet held by the
+running `ths` server. See [docs/cli.md](docs/cli.md) for the full command
+reference, including every `ths wallet` option, memo rules, and more examples.
 
 Every command accepts `--name` for isolated environments:
 
