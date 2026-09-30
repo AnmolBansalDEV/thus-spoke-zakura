@@ -120,19 +120,22 @@ impl NodeRpc {
                 );
                 Ok(Some(transaction))
             }
-            Err(error)
-                if error
-                    .downcast_ref::<RpcError>()
-                    .is_some_and(|error| error.code == -5) =>
-            {
-                Ok(None)
-            }
+            Err(error) if transaction_missing(&error) => Ok(None),
             Err(error) => Err(error),
         }
+    }
+    pub async fn transaction_known(&self, txid: &str) -> Result<bool> {
+        Ok(self.lookup_transaction(txid).await?.is_some())
     }
     pub async fn mempool(&self) -> Result<Vec<String>> {
         self.call("getrawmempool", json!([])).await
     }
+}
+
+fn transaction_missing(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<RpcError>()
+        .is_some_and(|error| error.code == -5)
 }
 
 fn classify_response<T: DeserializeOwned>(
@@ -167,5 +170,21 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.to_string(), "Zakura getblockcount timed out after 50ms");
+    }
+
+    #[test]
+    fn only_rpc_not_found_means_a_transaction_is_missing() {
+        let missing = anyhow::Error::new(RpcError {
+            code: -5,
+            message: "not found".into(),
+        })
+        .context("getrawtransaction failed");
+        let unavailable = anyhow::Error::new(RpcError {
+            code: -28,
+            message: "warming up".into(),
+        });
+
+        assert!(transaction_missing(&missing));
+        assert!(!transaction_missing(&unavailable));
     }
 }

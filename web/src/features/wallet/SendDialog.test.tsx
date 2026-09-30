@@ -73,6 +73,7 @@ describe('SendDialog', () => {
   let fetchMock: ReturnType<typeof mockSend>;
 
   beforeEach(() => {
+    sessionStorage.clear();
     fetchMock = mockSend();
   });
   afterEach(() => {
@@ -109,10 +110,47 @@ describe('SendDialog', () => {
     expect(body(fetchMock).amount_zatoshi).toBe(1);
   });
 
-  it('carries an idempotency key so a retry cannot double-spend', async () => {
+  it('uses a new idempotency key after a successful payment', async () => {
     await submitAmount('1');
     await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(1));
-    expect(body(fetchMock).idempotency_key).toHaveLength(36);
+    const first = body(fetchMock).idempotency_key;
+    await waitFor(() => expect(screen.getByRole('button', { name: /Send ZEC/i })).toBeEnabled());
+    await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
+    await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(2));
+    expect(first).toHaveLength(36);
+    expect(first).not.toBe(requestBody(sendCalls(fetchMock)[1]?.[1]).idempotency_key);
+  });
+
+  it('keeps a lost-response key across remounts but changes it for a different memo', async () => {
+    let lostSends = 2;
+    fetchMock.mockImplementation((input, init) => {
+      if (requestUrl(input).endsWith('/send') && lostSends-- > 0) {
+        return Promise.reject(new TypeError('response lost'));
+      }
+      return sendImpl(QUOTE)(input, init);
+    });
+    const first = renderWithProviders(
+      <SendDialog open onOpenChange={vi.fn()} accounts={testAccounts} />,
+    );
+    await userEvent.type(screen.getByLabelText('Memo (optional)'), 'rent');
+    await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
+    await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(1));
+
+    first.unmount();
+    renderWithProviders(<SendDialog open onOpenChange={vi.fn()} accounts={testAccounts} />);
+    const memo = screen.getByLabelText('Memo (optional)');
+    await userEvent.type(memo, 'rent');
+    await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
+    await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(2));
+
+    await userEvent.clear(memo);
+    await userEvent.type(memo, 'gift');
+    await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
+    await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(3));
+
+    const keys = sendCalls(fetchMock).map(([, init]) => requestBody(init).idempotency_key);
+    expect(keys[0]).toBe(keys[1]);
+    expect(keys[2]).not.toBe(keys[1]);
   });
 
   it('posts the memo with the send', async () => {
