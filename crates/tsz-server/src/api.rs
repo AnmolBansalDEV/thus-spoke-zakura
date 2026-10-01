@@ -1157,10 +1157,15 @@ async fn search(
         return address(State(state), Path(query.q)).await;
     }
     // Only a 64-character hash can also be a txid; anything else is answered by the block lookup.
+    // Other node failures must surface rather than fall through to the transaction lookup.
     match state.0.rpc.block(&query.q).await {
         Ok(block) => return Ok(Json(json!({"type":"block","value":block}))),
-        Err(error) if query.q.len() != 64 => return Err(not_found(error, NO_BLOCK)),
-        Err(_) => {}
+        Err(error) => {
+            let error = not_found(error, NO_BLOCK);
+            if query.q.len() != 64 || error.status != StatusCode::NOT_FOUND {
+                return Err(error);
+            }
+        }
     }
     let tx = state
         .0
@@ -2001,6 +2006,34 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
         }
+    }
+
+    #[tokio::test]
+    async fn search_does_not_mask_a_block_node_failure_as_404() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node = format!("http://{}", listener.local_addr().unwrap());
+        let failing = Router::new().route(
+            "/",
+            post(|Json(req): Json<Value>| async move {
+                let code = if req["method"] == "getblock" { -28 } else { -5 };
+                Json(json!({"error": {"code": code, "message": "injected"}}))
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, failing).await });
+
+        let (state, _dir) = state_with_local_wallet();
+        let state = AppState::new(
+            state.0.store.clone(),
+            state.0.wallet.clone(),
+            node,
+            "t".into(),
+        );
+        let uri = format!("/api/v1/search?q={}", "a".repeat(64));
+        let response = router(state)
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
