@@ -81,7 +81,6 @@ impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let connection = Connection::open(path)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
-        migrate_balance_columns(&connection)?;
         Ok(Self(Arc::new(Mutex::new(connection))))
     }
 
@@ -515,29 +514,6 @@ fn row_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
         ironwood_zatoshi: row.get(5)?,
     })
 }
-
-/// Stores created before NU6.3 have an `orchard_zatoshi` balance column. The
-/// Orchard pool can't receive funds on this chain, so the column is dropped
-/// rather than renamed: an old Orchard figure must not show up as Ironwood.
-fn migrate_balance_columns(db: &Connection) -> Result<()> {
-    let columns = db
-        .prepare("PRAGMA table_info(accounts)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    if columns.is_empty() {
-        return Ok(());
-    }
-    if columns.iter().any(|column| column == "orchard_zatoshi") {
-        db.execute("ALTER TABLE accounts DROP COLUMN orchard_zatoshi", [])?;
-    }
-    if !columns.iter().any(|column| column == "ironwood_zatoshi") {
-        db.execute(
-            "ALTER TABLE accounts ADD COLUMN ironwood_zatoshi INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-    }
-    Ok(())
-}
 fn row_activity(row: &rusqlite::Row<'_>) -> rusqlite::Result<Activity> {
     Ok(Activity {
         id: row.get(0)?,
@@ -654,7 +630,7 @@ mod tests {
                      id INTEGER PRIMARY KEY, name TEXT NOT NULL,
                      unified_address TEXT NOT NULL, transparent_address TEXT NOT NULL,
                      transparent_zatoshi INTEGER NOT NULL DEFAULT 0,
-                     orchard_zatoshi INTEGER NOT NULL DEFAULT 0
+                     ironwood_zatoshi INTEGER NOT NULL DEFAULT 0
                  );",
             )
             .unwrap();
@@ -667,7 +643,7 @@ mod tests {
                 let (ua, taddr) = derived_addresses(&seed, id).unwrap();
                 db.execute(
                     "INSERT INTO accounts
-                     (id,name,unified_address,transparent_address,transparent_zatoshi,orchard_zatoshi)
+                     (id,name,unified_address,transparent_address,transparent_zatoshi,ironwood_zatoshi)
                      VALUES(?1,?2,?3,?4,123,456)",
                     params![id, format!("Account {id}"), ua, taddr],
                 )
@@ -706,8 +682,7 @@ mod tests {
             assert!(encoded == expected);
             assert!(distinct.insert(encoded.to_owned()));
             assert_eq!(account.transparent_zatoshi, 123);
-            // The legacy Orchard balance is dropped, not carried into Ironwood.
-            assert_eq!(account.ironwood_zatoshi, 0);
+            assert_eq!(account.ironwood_zatoshi, 456);
         }
 
         let all = store.accounts().unwrap();
