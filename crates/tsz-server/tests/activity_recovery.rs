@@ -72,7 +72,7 @@ struct SyncStatus {
 #[derive(Debug, Deserialize)]
 struct AccountBalance {
     id: u8,
-    orchard_zatoshi: u64,
+    ironwood_zatoshi: u64,
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -95,7 +95,7 @@ async fn concurrent_identical_sends_have_one_chain_effect() -> Result<()> {
         let before_balance = before_accounts
             .iter()
             .find(|account| account.id == 2)
-            .map(|account| account.orchard_zatoshi)
+            .map(|account| account.ironwood_zatoshi)
             .ok_or_else(|| anyhow::anyhow!("destination account is missing"))?;
         let before_activities: Vec<Activity> = request_json(
             &client,
@@ -108,8 +108,8 @@ async fn concurrent_identical_sends_have_one_chain_effect() -> Result<()> {
         let request = json!({
             "from_account": 1,
             "to_account": 2,
-            "source_pool": "orchard",
-            "destination_pool": "orchard",
+            "source_pool": "ironwood",
+            "destination_pool": "ironwood",
             "amount_zatoshi": 10_000_000,
             "idempotency_key": CONCURRENT_IDEMPOTENCY_KEY,
         });
@@ -156,7 +156,7 @@ async fn concurrent_identical_sends_have_one_chain_effect() -> Result<()> {
         let after_balance = after_accounts
             .iter()
             .find(|account| account.id == 2)
-            .map(|account| account.orchard_zatoshi)
+            .map(|account| account.ironwood_zatoshi)
             .ok_or_else(|| anyhow::anyhow!("destination account is missing"))?;
         anyhow::ensure!(
             after_balance.checked_sub(before_balance) == Some(10_000_000),
@@ -335,7 +335,7 @@ async fn exercise_treasury_sync(
     let initial_balance = accounts
         .iter()
         .find(|account| account["id"] == 2)
-        .and_then(|account| account["orchard_zatoshi"].as_u64())
+        .and_then(|account| account["ironwood_zatoshi"].as_u64())
         .ok_or_else(|| anyhow::anyhow!("destination balance was missing"))?;
     for request in 0..10 {
         let payment: Activity = request_json(
@@ -344,7 +344,7 @@ async fn exercise_treasury_sync(
             "/api/v1/faucet",
             Some(&json!({
                 "account_id": 2,
-                "pool": "orchard",
+                "pool": "ironwood",
                 "amount_zatoshi": 500_000_000u64,
                 "idempotency_key": format!("treasury-history-faucet-{request}"),
             })),
@@ -367,7 +367,7 @@ async fn exercise_treasury_sync(
     let final_balance = accounts
         .iter()
         .find(|account| account["id"] == 2)
-        .and_then(|account| account["orchard_zatoshi"].as_u64())
+        .and_then(|account| account["ironwood_zatoshi"].as_u64())
         .ok_or_else(|| anyhow::anyhow!("final destination balance was missing"))?;
     anyhow::ensure!(
         final_balance == initial_balance + 5_000_000_000,
@@ -440,8 +440,8 @@ async fn exercise_recovery(
         Some(&json!({
             "from_account": 1,
             "to_account": 2,
-            "source_pool": "orchard",
-            "destination_pool": "orchard",
+            "source_pool": "ironwood",
+            "destination_pool": "ironwood",
             "amount_zatoshi": 1000000,
             "idempotency_key": RECOVERY_IDEMPOTENCY_KEY,
         })),
@@ -624,11 +624,11 @@ fn assert_requested_payment_fields(activity: &Activity) -> Result<()> {
         "activity destination account changed"
     );
     anyhow::ensure!(
-        activity.source_pool == "orchard",
+        activity.source_pool == "ironwood",
         "activity source pool changed"
     );
     anyhow::ensure!(
-        activity.destination_pool == "orchard",
+        activity.destination_pool == "ironwood",
         "activity destination pool changed"
     );
     anyhow::ensure!(
@@ -772,8 +772,8 @@ mod tests {
             kind: "send".to_owned(),
             from_account: Some(1),
             to_account: 2,
-            source_pool: "orchard".to_owned(),
-            destination_pool: "orchard".to_owned(),
+            source_pool: "ironwood".to_owned(),
+            destination_pool: "ironwood".to_owned(),
             amount_zatoshi: 1_000_000,
             txid: "b".repeat(64),
             block_hash: None,

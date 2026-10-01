@@ -136,4 +136,43 @@ describe('TransactionDetail', () => {
     expect(await screen.findByText('Only the fee is public')).toBeInTheDocument();
     expect(screen.queryByText(/Fully transparent/i)).not.toBeInTheDocument();
   });
+
+  it('shows an Ironwood transfer as shielded, not fully transparent', async () => {
+    // After NU6.3 every shielded send is an Ironwood bundle with an empty
+    // Orchard bundle; counting only Orchard labelled it fully transparent.
+    renderTx({
+      txid: TXID,
+      version: 6,
+      vin: [],
+      vout: [],
+      vShieldedSpend: [],
+      vShieldedOutput: [],
+      orchard: { actions: [], valueBalanceZat: 0 },
+      ironwood: { actions: [{}, {}], valueBalanceZat: 10_000 },
+    });
+
+    expect(await screen.findByText('Only the fee is public')).toBeInTheDocument();
+    expect(screen.getByText(/stay inside 2 Ironwood actions/)).toBeInTheDocument();
+    expect(screen.queryByText(/Fully transparent/i)).not.toBeInTheDocument();
+    // Pools the transaction doesn't use aren't listed.
+    expect(screen.getByText('Ironwood actions')).toBeInTheDocument();
+    expect(screen.queryByText('Orchard actions')).not.toBeInTheDocument();
+    expect(screen.queryByText(/^Sapling/)).not.toBeInTheDocument();
+  });
+
+  it('lists Orchard and Sapling only when the transaction uses them', async () => {
+    // External regtest clients can still make Sapling transactions after NU6.3.
+    renderTx({
+      txid: TXID,
+      vin: [],
+      vout: [],
+      vShieldedSpend: [{}],
+      vShieldedOutput: [{}, {}],
+      orchard: { actions: [{}], valueBalanceZat: 0 },
+    });
+
+    expect(await screen.findByText('Orchard actions')).toBeInTheDocument();
+    expect(screen.getByText('Sapling spends')).toBeInTheDocument();
+    expect(screen.getByText('Sapling outputs')).toBeInTheDocument();
+  });
 });

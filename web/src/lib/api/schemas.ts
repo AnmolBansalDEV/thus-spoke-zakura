@@ -16,7 +16,7 @@ const zatoshi = z
   .nonnegative()
   .transform((value) => BigInt(value));
 
-export const poolSchema = z.enum(['transparent', 'orchard']);
+export const poolSchema = z.enum(['transparent', 'ironwood']);
 export type Pool = z.infer<typeof poolSchema>;
 
 export const accountSchema = z.object({
@@ -26,7 +26,7 @@ export const accountSchema = z.object({
   transparent_address: z.string(),
   unified_full_viewing_key: z.string().optional(),
   transparent_zatoshi: zatoshi,
-  orchard_zatoshi: zatoshi,
+  ironwood_zatoshi: zatoshi,
 });
 export type Account = z.infer<typeof accountSchema>;
 
@@ -105,7 +105,17 @@ export const blockSchema = z.looseObject({
   tx: z.array(z.unknown()).default([]),
   difficulty: z.number().optional(),
   merkleroot: z.string().optional(),
+  finalsaplingroot: z.string().optional(),
   finalorchardroot: z.string().optional(),
+  // Note commitment tree sizes; the node leaves out pools whose tree is empty.
+  trees: z
+    .looseObject({
+      sapling: z.looseObject({ size: z.number() }).optional(),
+      orchard: z.looseObject({ size: z.number() }).optional(),
+    })
+    .optional(),
+  // Added by the server from `z_gettreestate`; absent for the genesis block.
+  finalironwoodroot: z.string().optional(),
   blockcommitments: z.string().optional(),
   version: z.number().optional(),
   chainSupply: z.looseObject({ chainValueZat: z.number().int().default(0) }).optional(),
@@ -165,6 +175,17 @@ export const transactionSchema = z.looseObject({
        * Net value moving in or out of the Orchard pool. This is public chain
        * data (ZIP 224), and on an otherwise shielded transfer it is the fee.
        */
+      valueBalanceZat: z.number().optional(),
+    })
+    .optional(),
+  /**
+   * The Ironwood bundle (NU6.3). Once NU6.3 is active every new shielded
+   * output is an Ironwood action, and its value balance is public like
+   * Orchard's.
+   */
+  ironwood: z
+    .looseObject({
+      actions: z.array(z.unknown()).default([]),
       valueBalanceZat: z.number().optional(),
     })
     .optional(),

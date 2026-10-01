@@ -281,7 +281,7 @@ struct WalletSyncResponse {
 #[derive(Debug, Deserialize)]
 struct AccountBalance {
     id: u8,
-    orchard_zatoshi: u64,
+    ironwood_zatoshi: u64,
 }
 
 /// Owns an isolated Zakura node, lightwalletd, proxy and `tsz-server` process.
@@ -805,7 +805,7 @@ impl RegtestStack {
                     );
                     let funded = accounts
                         .iter()
-                        .any(|account| account.id == 1 && account.orchard_zatoshi == 500_000_000);
+                        .any(|account| account.id == 1 && account.ironwood_zatoshi == 500_000_000);
                     if health.wallet_sync.state == "ready" && funded {
                         return Ok(());
                     }
