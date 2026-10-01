@@ -1206,7 +1206,27 @@ async fn seed(
     ))
 }
 async fn block(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
-    Ok(Json(state.0.rpc.block(&id).await?))
+    let mut block = state.0.rpc.block(&id).await?;
+    // `getblock` has no Ironwood root, but `z_gettreestate` does. The root is
+    // an extra detail, so a failed lookup still returns the block.
+    if let Some(hash) = block.get("hash").and_then(Value::as_str).map(str::to_owned) {
+        match state.0.rpc.treestate(&hash).await {
+            Ok(treestate) => add_ironwood_root(&mut block, &treestate),
+            Err(error) => tracing::warn!(%error, %hash, "reading the Ironwood treestate failed"),
+        }
+    }
+    Ok(Json(block))
+}
+/// Copies the Ironwood note commitment root from a `z_gettreestate` response
+/// into the block as `finalironwoodroot`, next to Zakura's `finalorchardroot`.
+/// Before NU6.3 the treestate has no Ironwood root and the block is unchanged.
+fn add_ironwood_root(block: &mut Value, treestate: &Value) {
+    let root = treestate
+        .pointer("/ironwood/commitments/finalRoot")
+        .and_then(Value::as_str);
+    if let (Some(root), Some(block)) = (root, block.as_object_mut()) {
+        block.insert("finalironwoodroot".to_owned(), Value::from(root));
+    }
 }
 #[derive(Deserialize)]
 struct BlocksQuery {
@@ -1951,6 +1971,22 @@ mod tests {
 
     fn is_bad_request<T>(result: ApiResult<T>) -> bool {
         matches!(result, Err(error) if error.status == StatusCode::BAD_REQUEST)
+    }
+
+    #[test]
+    fn copies_the_ironwood_root_from_the_treestate() {
+        let mut block = json!({"hash": "ab", "finalorchardroot": "orchard-root"});
+        add_ironwood_root(
+            &mut block,
+            &json!({"ironwood": {"commitments": {"finalRoot": "ironwood-root", "finalState": "00"}}}),
+        );
+        assert_eq!(block["finalironwoodroot"], "ironwood-root");
+        assert_eq!(block["finalorchardroot"], "orchard-root");
+
+        // Before NU6.3 Zakura returns empty Ironwood commitments.
+        let mut block = json!({"hash": "ab"});
+        add_ironwood_root(&mut block, &json!({"ironwood": {"commitments": {}}}));
+        assert!(block.get("finalironwoodroot").is_none());
     }
 
     #[test]

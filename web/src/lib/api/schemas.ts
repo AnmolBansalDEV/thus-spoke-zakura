@@ -108,6 +108,8 @@ export const blockSchema = z.looseObject({
   difficulty: z.number().optional(),
   merkleroot: z.string().optional(),
   finalorchardroot: z.string().optional(),
+  // Added by the server from `z_gettreestate`; absent before NU6.3.
+  finalironwoodroot: z.string().optional(),
   blockcommitments: z.string().optional(),
   version: z.number().optional(),
   chainSupply: z.looseObject({ chainValueZat: z.number().int().default(0) }).optional(),

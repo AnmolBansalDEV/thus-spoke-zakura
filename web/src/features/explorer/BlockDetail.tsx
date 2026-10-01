@@ -158,6 +158,11 @@ export function BlockDetail() {
               <code className="font-mono">{data.merkleroot}</code>
             </DataRow>
           )}
+          {data.finalironwoodroot && (
+            <DataRow label="Ironwood root">
+              <code className="font-mono">{data.finalironwoodroot}</code>
+            </DataRow>
+          )}
           {data.finalorchardroot && (
             <DataRow label="Orchard root">
               <code className="font-mono">{data.finalorchardroot}</code>
