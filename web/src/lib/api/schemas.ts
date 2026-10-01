@@ -26,9 +26,7 @@ export const accountSchema = z.object({
   transparent_address: z.string(),
   unified_full_viewing_key: z.string().optional(),
   transparent_zatoshi: zatoshi,
-  // Servers from before NU6.3 activation report no Ironwood balance (only an
-  // `orchard_zatoshi`, which is dropped here: Orchard can't hold funds on this chain).
-  ironwood_zatoshi: zatoshi.default(0n),
+  ironwood_zatoshi: zatoshi,
 });
 export type Account = z.infer<typeof accountSchema>;
 
@@ -116,7 +114,7 @@ export const blockSchema = z.looseObject({
       orchard: z.looseObject({ size: z.number() }).optional(),
     })
     .optional(),
-  // Added by the server from `z_gettreestate`; absent before NU6.3.
+  // Added by the server from `z_gettreestate`; absent for the genesis block.
   finalironwoodroot: z.string().optional(),
   blockcommitments: z.string().optional(),
   version: z.number().optional(),

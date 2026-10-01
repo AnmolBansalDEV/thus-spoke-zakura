@@ -1219,7 +1219,8 @@ async fn block(State(state): State<AppState>, Path(id): Path<String>) -> ApiResu
 }
 /// Copies the Ironwood note commitment root from a `z_gettreestate` response
 /// into the block as `finalironwoodroot`, next to Zakura's `finalorchardroot`.
-/// Before NU6.3 the treestate has no Ironwood root and the block is unchanged.
+/// The genesis block (before NU6.3 activates at height 1) has no Ironwood root and
+/// stays unchanged.
 fn add_ironwood_root(block: &mut Value, treestate: &Value) {
     let root = treestate
         .pointer("/ironwood/commitments/finalRoot")
@@ -1983,7 +1984,7 @@ mod tests {
         assert_eq!(block["finalironwoodroot"], "ironwood-root");
         assert_eq!(block["finalorchardroot"], "orchard-root");
 
-        // Before NU6.3 Zakura returns empty Ironwood commitments.
+        // At the genesis block Zakura returns empty Ironwood commitments.
         let mut block = json!({"hash": "ab"});
         add_ironwood_root(&mut block, &json!({"ironwood": {"commitments": {}}}));
         assert!(block.get("finalironwoodroot").is_none());
