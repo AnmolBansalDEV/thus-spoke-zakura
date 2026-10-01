@@ -42,19 +42,35 @@ const block = {
   finalorchardroot: ORCHARD_ROOT,
 };
 
+const SAPLING_ROOT = '5a'.repeat(32);
+
 describe('BlockDetail', () => {
-  it('shows the Ironwood root the server adds from z_gettreestate', async () => {
-    renderBlock({ ...block, finalironwoodroot: IRONWOOD_ROOT });
+  it('shows the Ironwood root and hides the roots of empty pools', async () => {
+    // A block on this chain: Orchard and Sapling trees are empty, so `trees` has only
+    // Ironwood, yet the node still reports their (empty-tree) roots.
+    renderBlock({
+      ...block,
+      finalironwoodroot: IRONWOOD_ROOT,
+      finalsaplingroot: SAPLING_ROOT,
+      trees: { ironwood: { size: 10 } },
+    });
 
     expect(await screen.findByText('Ironwood root')).toBeInTheDocument();
     expect(screen.getByText(IRONWOOD_ROOT)).toBeInTheDocument();
-    expect(screen.getByText(ORCHARD_ROOT)).toBeInTheDocument();
+    expect(screen.queryByText('Orchard root')).not.toBeInTheDocument();
+    expect(screen.queryByText('Sapling root')).not.toBeInTheDocument();
   });
 
-  it('leaves the row out before NU6.3', async () => {
-    renderBlock(block);
+  it('shows Orchard and Sapling roots once their trees hold notes', async () => {
+    renderBlock({
+      ...block,
+      finalsaplingroot: SAPLING_ROOT,
+      trees: { sapling: { size: 2 }, orchard: { size: 4 } },
+    });
 
     expect(await screen.findByText('Orchard root')).toBeInTheDocument();
+    expect(screen.getByText(ORCHARD_ROOT)).toBeInTheDocument();
+    expect(screen.getByText(SAPLING_ROOT)).toBeInTheDocument();
     expect(screen.queryByText('Ironwood root')).not.toBeInTheDocument();
   });
 });

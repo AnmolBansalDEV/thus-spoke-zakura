@@ -170,12 +170,21 @@ export function TransactionDetail() {
           </div>
         )}
 
+        {/* Ironwood and transparent always; other pools only when the transaction uses
+            them (this chain activates NU6.3 at height 1, so they're usually empty). */}
         <dl>
           <DataRow label="Ironwood actions">{shielding.ironwoodActions}</DataRow>
-          <DataRow label="Orchard actions">{shielding.orchardActions}</DataRow>
+          {shielding.orchardActions > 0 && (
+            <DataRow label="Orchard actions">{shielding.orchardActions}</DataRow>
+          )}
+          {shielding.saplingSpends > 0 && (
+            <DataRow label="Sapling spends">{shielding.saplingSpends}</DataRow>
+          )}
+          {shielding.saplingOutputs > 0 && (
+            <DataRow label="Sapling outputs">{shielding.saplingOutputs}</DataRow>
+          )}
           <DataRow label="Transparent inputs">{shielding.transparentInputs}</DataRow>
           <DataRow label="Transparent outputs">{shielding.transparentOutputs}</DataRow>
-          <DataRow label="Sapling">{shielding.saplingSpends + shielding.saplingOutputs}</DataRow>
         </dl>
 
         {!shielding.shieldedOnly && !shielding.mixed && (

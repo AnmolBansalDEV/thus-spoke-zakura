@@ -59,15 +59,18 @@ export function summariseShielding(tx: Transaction): ShieldingSummary {
   };
 }
 
-function countActions(count: number, pool: string): string {
-  return `${count} ${pool} action${count === 1 ? '' : 's'}`;
+function count(n: number, what: string): string {
+  return `${n} ${what}${n === 1 ? '' : 's'}`;
 }
 
-/** Names the shielded actions by pool, e.g. "2 Ironwood actions". */
+/** Names the shielded parts by pool, e.g. "2 Ironwood actions" or "1 Sapling spend". */
 export function actionSummary(summary: ShieldingSummary): string {
   const parts = [];
-  if (summary.ironwoodActions > 0) parts.push(countActions(summary.ironwoodActions, 'Ironwood'));
-  if (summary.orchardActions > 0) parts.push(countActions(summary.orchardActions, 'Orchard'));
-  if (parts.length === 0) return countActions(0, 'shielded');
-  return parts.join(' and ');
+  if (summary.ironwoodActions > 0) parts.push(count(summary.ironwoodActions, 'Ironwood action'));
+  if (summary.orchardActions > 0) parts.push(count(summary.orchardActions, 'Orchard action'));
+  if (summary.saplingSpends > 0) parts.push(count(summary.saplingSpends, 'Sapling spend'));
+  if (summary.saplingOutputs > 0) parts.push(count(summary.saplingOutputs, 'Sapling output'));
+  const last = parts.pop();
+  if (last === undefined) return count(0, 'shielded action');
+  return parts.length === 0 ? last : `${parts.join(', ')} and ${last}`;
 }

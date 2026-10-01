@@ -163,9 +163,16 @@ export function BlockDetail() {
               <code className="font-mono">{data.finalironwoodroot}</code>
             </DataRow>
           )}
-          {data.finalorchardroot && (
+          {/* An empty tree still has a root; show Orchard and Sapling roots only once
+              their tree holds notes (`trees` leaves out empty pools). */}
+          {data.finalorchardroot && (data.trees?.orchard?.size ?? 0) > 0 && (
             <DataRow label="Orchard root">
               <code className="font-mono">{data.finalorchardroot}</code>
+            </DataRow>
+          )}
+          {data.finalsaplingroot && (data.trees?.sapling?.size ?? 0) > 0 && (
+            <DataRow label="Sapling root">
+              <code className="font-mono">{data.finalsaplingroot}</code>
             </DataRow>
           )}
           {data.blockcommitments && (

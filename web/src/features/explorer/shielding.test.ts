@@ -116,4 +116,16 @@ describe('actionSummary', () => {
     expect(summarise(1, 2)).toBe('1 Ironwood action and 2 Orchard actions');
     expect(summarise(0, 0)).toBe('0 shielded actions');
   });
+
+  it('names Sapling spends and outputs, which external clients can still create', () => {
+    const summary = summariseShielding({
+      ...base,
+      vShieldedSpend: [{}],
+      vShieldedOutput: [{}, {}],
+      ironwood: { actions: [{}, {}] },
+    });
+    expect(actionSummary(summary)).toBe(
+      '2 Ironwood actions, 1 Sapling spend and 2 Sapling outputs',
+    );
+  });
 });

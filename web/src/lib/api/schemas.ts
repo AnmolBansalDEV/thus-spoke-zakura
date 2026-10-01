@@ -107,7 +107,15 @@ export const blockSchema = z.looseObject({
   tx: z.array(z.unknown()).default([]),
   difficulty: z.number().optional(),
   merkleroot: z.string().optional(),
+  finalsaplingroot: z.string().optional(),
   finalorchardroot: z.string().optional(),
+  // Note commitment tree sizes; the node leaves out pools whose tree is empty.
+  trees: z
+    .looseObject({
+      sapling: z.looseObject({ size: z.number() }).optional(),
+      orchard: z.looseObject({ size: z.number() }).optional(),
+    })
+    .optional(),
   // Added by the server from `z_gettreestate`; absent before NU6.3.
   finalironwoodroot: z.string().optional(),
   blockcommitments: z.string().optional(),
