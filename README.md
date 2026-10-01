@@ -266,11 +266,12 @@ cargo test --locked --profile dev-runtime -p tsz-server --test activity_recovery
 docker pull zakuracore/zakura:1.4.0
 docker build -f docker/lightwalletd.Dockerfile -t tsz-recovery-lightwalletd:local .
 cargo test --locked --profile dev-runtime -p tsz-server --test activity_recovery -- --ignored --exact broadcast_recovers_after_auto_mine_failure
+cargo test --locked --profile dev-runtime -p tsz-server --test activity_recovery -- --ignored --exact concurrent_identical_sends_have_one_chain_effect
 ```
 
 The first command compiles the integration target. The second runs its
 Docker-free helper coverage and leaves the ignored live regression unexecuted.
-The last command explicitly selects the live regression; Cargo supplies that
+The last two commands explicitly select the live regressions; Cargo supplies that
 target with the matching source-built `tsz-server` binary, including when
 `CARGO_TARGET_DIR` is set. Do not substitute an installed or older binary.
 
