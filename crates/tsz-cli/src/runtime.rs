@@ -17,7 +17,7 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 const APP_IMAGE_REPOSITORY: &str = "ghcr.io/zcashlabs/thus-spoke-zakura-app";
-const ZAKURA_IMAGE: &str = "zakuracore/zakura:1.4.0";
+const ZAKURA_IMAGE: &str = "zakuracore/zakura:1.6.0";
 const LIGHTWALLETD_IMAGE_REPOSITORY: &str = "ghcr.io/zcashlabs/thus-spoke-zakura-lightwalletd";
 
 fn app_image() -> String {
