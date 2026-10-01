@@ -19,7 +19,7 @@ function useInvalidateWallet() {
 }
 
 function operationKey<T>(kind: string, fingerprint: (variables: T) => string) {
-  const storageKey = (variables: T) => `tsz:${kind}:${fingerprint(variables)}`;
+  const storageKey = (variables: T) => `ths:${kind}:${fingerprint(variables)}`;
   return {
     keyFor(variables: T) {
       const storage = storageKey(variables);

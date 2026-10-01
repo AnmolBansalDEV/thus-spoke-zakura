@@ -2,7 +2,7 @@
 set -eu
 
 root="$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
-tmp="$(mktemp -d -t tsz-install-test.XXXXXX)"
+tmp="$(mktemp -d -t ths-install-test.XXXXXX)"
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 
 target="x86_64-unknown-linux-gnu"
@@ -51,8 +51,8 @@ EOF
 chmod +x "$bin/curl"
 
 printf '%s\n' old > "$install_dir/ths"
-PATH="$bin:$PATH" FIXTURES="$fixtures" TSZ_INSTALL_DIR="$install_dir" \
-  TSZ_VERSION=v9.8.7 TSZ_SKIP_IMAGE_PULL=1 "$root/install.sh"
+PATH="$bin:$PATH" FIXTURES="$fixtures" THS_INSTALL_DIR="$install_dir" \
+  THS_VERSION=v9.8.7 THS_SKIP_IMAGE_PULL=1 "$root/install.sh"
 test "$("$install_dir/ths" --version)" = "ths 9.8.7"
 test ! -e "$install_dir/thus-spoke-zakura"
 
@@ -67,24 +67,24 @@ else
   hash="$(shasum -a 256 "$fixtures/$asset" | awk '{print $1}')"
 fi
 printf '%s  %s\n' "$hash" "$asset" > "$fixtures/SHA256SUMS"
-PATH="$bin:$PATH" FIXTURES="$fixtures" TSZ_INSTALL_DIR="$install_dir" \
-  TSZ_VERSION=8.0.0 TSZ_SKIP_IMAGE_PULL=1 "$root/install.sh"
+PATH="$bin:$PATH" FIXTURES="$fixtures" THS_INSTALL_DIR="$install_dir" \
+  THS_VERSION=8.0.0 THS_SKIP_IMAGE_PULL=1 "$root/install.sh"
 test "$("$install_dir/ths" --version)" = "ths 8.0.0"
-PATH="$bin:$PATH" FIXTURES="$fixtures" TSZ_INSTALL_DIR="$install_dir" \
-  TSZ_VERSION=8.0.0 TSZ_SKIP_IMAGE_PULL=1 "$root/install.sh"
+PATH="$bin:$PATH" FIXTURES="$fixtures" THS_INSTALL_DIR="$install_dir" \
+  THS_VERSION=8.0.0 THS_SKIP_IMAGE_PULL=1 "$root/install.sh"
 test "$("$install_dir/ths" --version)" = "ths 8.0.0"
 
 printf '%s\n' old > "$install_dir/ths"
-if PATH="$bin:$PATH" FIXTURES="$fixtures" FAIL_PULL=1 TSZ_INSTALL_DIR="$install_dir" \
-  TSZ_VERSION=8.0.0 "$root/install.sh"; then
+if PATH="$bin:$PATH" FIXTURES="$fixtures" FAIL_PULL=1 THS_INSTALL_DIR="$install_dir" \
+  THS_VERSION=8.0.0 "$root/install.sh"; then
   echo "installer unexpectedly succeeded when image pull failed" >&2
   exit 1
 fi
 test "$(cat "$install_dir/ths")" = old
 
 printf '%s\n' "deadbeef  $asset" > "$fixtures/SHA256SUMS"
-if PATH="$bin:$PATH" FIXTURES="$fixtures" TSZ_INSTALL_DIR="$install_dir" \
-  TSZ_VERSION=v9.8.7 TSZ_SKIP_IMAGE_PULL=1 "$root/install.sh"; then
+if PATH="$bin:$PATH" FIXTURES="$fixtures" THS_INSTALL_DIR="$install_dir" \
+  THS_VERSION=v9.8.7 THS_SKIP_IMAGE_PULL=1 "$root/install.sh"; then
   echo "installer unexpectedly accepted a bad checksum" >&2
   exit 1
 fi
@@ -97,8 +97,8 @@ else
   hash="$(shasum -a 256 "$fixtures/$asset" | awk '{print $1}')"
 fi
 printf '%s  %s\n' "$hash" "$asset" > "$fixtures/SHA256SUMS"
-if PATH="$bin:$PATH" FIXTURES="$fixtures" TSZ_INSTALL_DIR="$install_dir" \
-  TSZ_VERSION=v9.8.7 TSZ_SKIP_IMAGE_PULL=1 "$root/install.sh"; then
+if PATH="$bin:$PATH" FIXTURES="$fixtures" THS_INSTALL_DIR="$install_dir" \
+  THS_VERSION=v9.8.7 THS_SKIP_IMAGE_PULL=1 "$root/install.sh"; then
   echo "installer unexpectedly accepted an incomplete archive" >&2
   exit 1
 fi

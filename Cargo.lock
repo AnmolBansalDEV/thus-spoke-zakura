@@ -2943,6 +2943,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "ths-server"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "axum",
+ "bip39",
+ "clap",
+ "futures-core",
+ "futures-util",
+ "hex",
+ "rand 0.10.2",
+ "reqwest",
+ "rusqlite",
+ "schemerz",
+ "schemerz-rusqlite",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tonic",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "zakura-client-backend",
+ "zakura-client-sqlite",
+ "zakura-keys",
+ "zakura-orchard",
+ "zakura-pczt",
+ "zakura-primitives",
+ "zakura-proofs",
+ "zakura-sapling-crypto",
+ "zcash_protocol",
+ "zcash_script",
+ "zcash_transparent",
+ "zip32",
+ "zip321",
+]
+
+[[package]]
 name = "thus-spoke-zakura"
 version = "0.2.1"
 dependencies = [
@@ -3270,51 +3315,6 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
-
-[[package]]
-name = "tsz-server"
-version = "0.2.1"
-dependencies = [
- "anyhow",
- "async-stream",
- "async-trait",
- "axum",
- "bip39",
- "clap",
- "futures-core",
- "futures-util",
- "hex",
- "rand 0.10.2",
- "reqwest",
- "rusqlite",
- "schemerz",
- "schemerz-rusqlite",
- "secrecy",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "tonic",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "zakura-client-backend",
- "zakura-client-sqlite",
- "zakura-keys",
- "zakura-orchard",
- "zakura-pczt",
- "zakura-primitives",
- "zakura-proofs",
- "zakura-sapling-crypto",
- "zcash_protocol",
- "zcash_script",
- "zcash_transparent",
- "zip32",
- "zip321",
-]
 
 [[package]]
 name = "typenum"

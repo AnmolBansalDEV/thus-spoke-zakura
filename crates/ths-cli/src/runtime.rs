@@ -579,10 +579,10 @@ fn require_free_loopback(port: u16) -> Result<()> {
 }
 
 fn prefix(name: &InstanceName) -> String {
-    format!("tsz-{name}")
+    format!("ths-{name}")
 }
 fn label(name: &InstanceName) -> String {
-    format!("com.zakura.tsz.instance={name}")
+    format!("com.zakura.ths.instance={name}")
 }
 
 fn ensure_network(prefix: &str) -> Result<()> {
@@ -689,19 +689,19 @@ fn ensure_app(prefix: &str, name: &InstanceName, ports: &HostPorts) -> Result<()
             "-p",
             &dashboard_bind,
             "-e",
-            "TSZ_LISTEN=0.0.0.0:8080",
+            "THS_LISTEN=0.0.0.0:8080",
             "-e",
-            "TSZ_ZAKURA_RPC=http://zakura:18232",
+            "THS_ZAKURA_RPC=http://zakura:18232",
             "-e",
-            "TSZ_LIGHTWALLETD=http://lightwalletd:9067",
+            "THS_LIGHTWALLETD=http://lightwalletd:9067",
             "-e",
-            &format!("TSZ_INSTANCE={name}"),
+            &format!("THS_INSTANCE={name}"),
             "-e",
-            &format!("TSZ_PUBLIC_ZAKURA_RPC={public_rpc}"),
+            &format!("THS_PUBLIC_ZAKURA_RPC={public_rpc}"),
             "-e",
-            &format!("TSZ_PUBLIC_LIGHTWALLETD={public_lightwalletd}"),
+            &format!("THS_PUBLIC_LIGHTWALLETD={public_lightwalletd}"),
             "-e",
-            &format!("TSZ_PUBLIC_P2P={public_p2p}"),
+            &format!("THS_PUBLIC_P2P={public_p2p}"),
             "-v",
             &format!("{prefix}-wallet:/data"),
             &image,
@@ -1323,7 +1323,7 @@ mod tests {
 
     fn runtime_for_tests() -> Runtime {
         Runtime {
-            root: std::env::temp_dir().join("tsz-start-cleanup-tests"),
+            root: std::env::temp_dir().join("ths-start-cleanup-tests"),
         }
     }
 

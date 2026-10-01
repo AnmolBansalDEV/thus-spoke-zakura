@@ -14,6 +14,8 @@ use zcash_protocol::TxId;
 use super::*;
 use crate::db::TreasuryCursor;
 
+// This persisted schema name and migration UUID predate the ths rename and
+// must remain consistent with wallets that already applied the migration.
 pub(super) struct TreasuryCursorMigration;
 
 impl schemerz::Migration<Uuid> for TreasuryCursorMigration {
@@ -297,7 +299,7 @@ mod tests {
         let reward = transaction(&receiver, OutPoint::new([0; 32], u32::MAX), 0);
         let txid = reward.txid();
         let connection = rusqlite::Connection::open(dir.path().join("wallet.db")).unwrap();
-        connection.execute_batch("CREATE TRIGGER ext_tsz_fail_cursor BEFORE UPDATE ON ext_tsz_treasury_cursor BEGIN SELECT RAISE(ABORT, 'injected cursor failure'); END").unwrap();
+        connection.execute_batch("CREATE TRIGGER ext_ths_fail_cursor BEFORE UPDATE ON ext_tsz_treasury_cursor BEGIN SELECT RAISE(ABORT, 'injected cursor failure'); END").unwrap();
 
         let error = wallet
             .commit_treasury_discovery(&initial, &checkpoint(2, 2), Some(&raw(&reward)), &[])
@@ -316,7 +318,7 @@ mod tests {
         );
 
         connection
-            .execute_batch("DROP TRIGGER ext_tsz_fail_cursor")
+            .execute_batch("DROP TRIGGER ext_ths_fail_cursor")
             .unwrap();
         let advanced = wallet
             .commit_treasury_discovery(&initial, &checkpoint(2, 2), Some(&raw(&reward)), &[])
@@ -431,7 +433,7 @@ mod tests {
             Some(2.into())
         );
         let connection = rusqlite::Connection::open(dir.path().join("wallet.db")).unwrap();
-        connection.execute_batch("CREATE TRIGGER ext_tsz_fail_rewind BEFORE UPDATE ON ext_tsz_treasury_cursor BEGIN SELECT RAISE(ABORT, 'injected rewind failure'); END").unwrap();
+        connection.execute_batch("CREATE TRIGGER ext_ths_fail_rewind BEFORE UPDATE ON ext_tsz_treasury_cursor BEGIN SELECT RAISE(ABORT, 'injected rewind failure'); END").unwrap();
         let state = ChainState::empty(1.into(), BlockHash([1; 32]));
         let error = wallet.rewind_to_height(state.clone()).await.unwrap_err();
         assert!(error.to_string().contains("injected rewind failure"));
@@ -445,7 +447,7 @@ mod tests {
         );
 
         connection
-            .execute_batch("DROP TRIGGER ext_tsz_fail_rewind")
+            .execute_batch("DROP TRIGGER ext_ths_fail_rewind")
             .unwrap();
         wallet.rewind_to_height(state).await.unwrap();
         let cursor = wallet.treasury_cursor().await.unwrap().unwrap();

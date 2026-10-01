@@ -108,7 +108,7 @@ struct OwnedNames {
 
 impl OwnedNames {
     fn new() -> Self {
-        let prefix = format!("tsz-recovery-{}", Uuid::new_v4());
+        let prefix = format!("ths-recovery-{}", Uuid::new_v4());
         Self {
             network: prefix.clone(),
             chain_volume: format!("{prefix}-chain"),
@@ -284,7 +284,7 @@ struct AccountBalance {
     ironwood_zatoshi: u64,
 }
 
-/// Owns an isolated Zakura node, lightwalletd, proxy and `tsz-server` process.
+/// Owns an isolated Zakura node, lightwalletd, proxy and `ths-server` process.
 pub struct RegtestStack {
     server: PathBuf,
     temporary_directory: Option<TempDir>,
@@ -479,7 +479,7 @@ impl RegtestStack {
                 format!("{}:/var/lib/lightwalletd", self.names.lightwalletd_volume),
                 "--publish".into(),
                 "127.0.0.1::9067".into(),
-                "tsz-recovery-lightwalletd:local".into(),
+                "ths-recovery-lightwalletd:local".into(),
                 "--no-tls-very-insecure".into(),
                 "--grpc-bind-addr".into(),
                 "0.0.0.0:9067".into(),
@@ -619,18 +619,18 @@ impl RegtestStack {
     fn require_server_path(&self) -> Result<()> {
         ensure!(
             self.server.is_file(),
-            "Cargo-provided tsz-server path is not a regular file"
+            "Cargo-provided ths-server path is not a regular file"
         );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(&self.server)
-                .map_err(|_| anyhow::anyhow!("reading Cargo-provided tsz-server permissions"))?
+                .map_err(|_| anyhow::anyhow!("reading Cargo-provided ths-server permissions"))?
                 .permissions()
                 .mode();
             ensure!(
                 mode & 0o111 != 0,
-                "Cargo-provided tsz-server path is not executable"
+                "Cargo-provided ths-server path is not executable"
             );
         }
         Ok(())
@@ -830,13 +830,13 @@ impl RegtestStack {
             .arg("serve")
             .arg("--data-dir")
             .arg(&self.data_dir)
-            .env("TSZ_ZAKURA_RPC", proxy_url)
+            .env("THS_ZAKURA_RPC", proxy_url)
             .env(
-                "TSZ_LIGHTWALLETD",
+                "THS_LIGHTWALLETD",
                 format!("http://127.0.0.1:{lightwalletd_port}"),
             )
-            .env("TSZ_INSTANCE", &self.names.prefix)
-            .env("TSZ_LISTEN", format!("127.0.0.1:{api_port}"))
+            .env("THS_INSTANCE", &self.names.prefix)
+            .env("THS_LISTEN", format!("127.0.0.1:{api_port}"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1606,7 +1606,7 @@ mod tests {
     }
 
     fn test_server_path() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_BIN_EXE_tsz-server"))
+        std::path::PathBuf::from(env!("CARGO_BIN_EXE_ths-server"))
     }
 
     #[test]
@@ -1765,7 +1765,7 @@ mod tests {
         assert!(
             first_removals
                 .iter()
-                .all(|name| name.starts_with("tsz-recovery-"))
+                .all(|name| name.starts_with("ths-recovery-"))
         );
         assert_eq!(fixture.cleanup.len(), 1);
 

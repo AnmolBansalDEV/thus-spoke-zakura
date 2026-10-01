@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
 /**
- * Runtime contracts for the tsz-server API. These are validated rather than
+ * Runtime contracts for the ths-server API. These are validated rather than
  * merely declared: if the Rust structs change shape, the UI fails loudly at
  * the boundary instead of rendering `undefined` somewhere deep in a tree.
  *

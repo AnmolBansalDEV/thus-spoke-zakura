@@ -76,6 +76,9 @@ type Db = WalletDb<rusqlite::Connection, LocalNetwork, SystemClock, UnwrapErr<Sy
 const PREPARED_PAYMENTS_MIGRATION_ID: Uuid =
     Uuid::from_u128(0x695f93ac_6935_47e8_8f06_017b1d7ec3aa);
 
+// Keep the ext_tsz_* schema names and migration UUIDs stable: existing wallets
+// have already applied these migrations, so changing their definitions would
+// produce a different schema only for newly initialized wallets.
 struct PreparedPaymentsMigration;
 
 impl schemerz::Migration<Uuid> for PreparedPaymentsMigration {
@@ -330,7 +333,7 @@ impl RealWallet {
         Ok(Self {
             db: Arc::new(Mutex::new(db)),
             account_ids,
-            lightwalletd: std::env::var("TSZ_LIGHTWALLETD")
+            lightwalletd: std::env::var("THS_LIGHTWALLETD")
                 .unwrap_or_else(|_| "http://127.0.0.1:9067".into()),
         })
     }
