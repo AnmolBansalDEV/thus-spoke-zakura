@@ -187,9 +187,9 @@ and Send dialogs, from a script or terminal:
 | Subcommand | What it does |
 | --- | --- |
 | `ths wallet faucet` | Fund one or more accounts from the treasury |
-| `ths wallet send` | Send funds from one account to another, with an optional memo |
-| `ths wallet shield` | Spend one account's transparent funds into another account's Ironwood balance |
-| `ths wallet unshield` | Spend one account's Ironwood funds into another account's transparent balance |
+| `ths wallet send` | Send funds between accounts or pools, with an optional memo |
+| `ths wallet shield` | Spend transparent funds into the same or another account's Ironwood balance |
+| `ths wallet unshield` | Spend Ironwood funds into the same or another account's transparent balance |
 
 Every subcommand mines the confirming block automatically and prints the
 resulting transaction ID (and, for `send`, `shield`, and `unshield`, the
@@ -223,12 +223,13 @@ a non-zero status summarizing how many of the requests failed.
 
 ### `ths wallet send --from <N> --to <N> --amount <ZEC> [--source-pool <POOL>] [--destination-pool <POOL>] [--memo <TEXT>]`
 
-Sends funds from one development account to another. It does the same thing as
+Sends funds between development accounts or pools. It does the same thing as
 the dashboard's **Send ZEC** dialog and uses the same endpoint
 (`POST /api/v1/send`).
 
-- `--from <N>` / `--to <N>` (required): two different account indices,
-  `1`-`5`. The treasury account can't be used.
+- `--from <N>` / `--to <N>` (required): two account indices,
+  1–5. They may match when the source and destination pools differ. The treasury
+  account cannot be used.
 - `--amount <ZEC>` (required): limited only by the sending account's balance.
 - `--source-pool <ironwood|transparent>`: pool to spend from (default
   `ironwood`).
@@ -243,6 +244,10 @@ ths wallet send --from 2 --to 3 --amount 1
 # Spend account 1's transparent balance into account 4's Ironwood balance
 ths wallet send --from 1 --to 4 --amount 0.5 --source-pool transparent
 
+# Move funds between pools within account 1
+ths wallet send --from 1 --to 1 --amount 0.01 --destination-pool transparent
+ths wallet send --from 1 --to 1 --amount 0.005 --source-pool transparent
+
 # Attach a memo for the recipient
 ths wallet send --from 2 --to 3 --amount 1 --memo "rent for October"
 
@@ -250,15 +255,17 @@ ths wallet send --from 2 --to 3 --amount 1 --memo "rent for October"
 ths wallet send --from 2 --to 3 --amount 1 --destination-pool transparent --memo "hi"
 ```
 
+Same-account transfers require sufficient spendable funds for the amount and fee.
+
 ### `ths wallet shield --from <N> --to <N> --amount <ZEC> [--memo <TEXT>]`
 
 Shorthand for `ths wallet send` with `--source-pool transparent
 --destination-pool ironwood`: spends one account's transparent balance into
-another account's Ironwood balance.
+the same or another account's Ironwood balance.
 
 - `--from <N>` (required): account to spend transparent funds from.
-- `--to <N>` (required): a different account to receive them as Ironwood
-  funds. Sends between the same account are rejected.
+- `--to <N>` (required): account to receive them as Ironwood funds; may match
+  `--from`.
 - `--amount <ZEC>` (required).
 - `--memo <TEXT>`: optional memo on the Ironwood output (up to 512 bytes).
 
@@ -266,30 +273,38 @@ another account's Ironwood balance.
 # Shield 0.5 ZEC of account 4's transparent balance into account 2's Ironwood balance
 ths wallet shield --from 4 --to 2 --amount 0.5
 
+# Shield within account 1
+ths wallet shield --from 1 --to 1 --amount 0.005
+
 # The same, with a memo
 ths wallet shield --from 4 --to 2 --amount 0.5 --memo "welcome to the shielded pool"
 ```
 
-> Note: because transparent notes must be fully spent, the wallet may route
-> any leftover change from a transparent source into the shielded pool as
-> well. Shielding "0.5 ZEC" from an account holding 1 transparent ZEC can
-> leave that account with its change in Ironwood rather than transparent.
+These transfers require sufficient spendable funds for the amount and fee.
+
+> Note: wallet input selection may route leftover transparent change into
+> the shielded pool as well. Shielding "0.5 ZEC" from an account holding
+> 1 transparent ZEC can leave that account with its change in Ironwood
+> rather than transparent.
 
 ### `ths wallet unshield --from <N> --to <N> --amount <ZEC>`
 
 Shorthand for `ths wallet send` with `--source-pool ironwood
 --destination-pool transparent`: spends one account's Ironwood balance into
-another account's transparent balance. It takes no memo, because transparent
-outputs cannot carry one.
+the same or another account's transparent balance. It takes no memo, because
+transparent outputs cannot carry one.
 
 - `--from <N>` (required): account to spend Ironwood funds from.
-- `--to <N>` (required): a different account to receive them as transparent
-  funds.
+- `--to <N>` (required): account to receive them as transparent funds; may match
+  `--from`.
 - `--amount <ZEC>` (required).
 
 ```console
 # Unshield 0.2 ZEC from account 1's Ironwood balance into account 3's transparent balance
 ths wallet unshield --from 1 --to 3 --amount 0.2
+
+# Unshield within account 1
+ths wallet unshield --from 1 --to 1 --amount 0.01
 ```
 
 ### Memos
@@ -353,9 +368,9 @@ account 1 to account 3, all without opening the dashboard.
 | `ths mine <N>` | Mine blocks and synchronize the wallet |
 | `ths faucet <ADDRESS> [--amount]` | Send disposable ZEC to any Regtest address |
 | `ths wallet faucet --accounts <LIST> [--amount] [--pool]` | Fund one or more of the five accounts by index |
-| `ths wallet send --from --to --amount [--source-pool] [--destination-pool] [--memo]` | Send between accounts by index, optionally with an Ironwood memo |
-| `ths wallet shield --from --to --amount [--memo]` | Spend transparent funds into another account's Ironwood balance |
-| `ths wallet unshield --from --to --amount` | Spend Ironwood funds into another account's transparent balance |
+| `ths wallet send --from --to --amount [--source-pool] [--destination-pool] [--memo]` | Send between accounts or pools, optionally with an Ironwood memo |
+| `ths wallet shield --from --to --amount [--memo]` | Spend transparent funds into the same or another account's Ironwood balance |
+| `ths wallet unshield --from --to --amount` | Spend Ironwood funds into the same or another account's transparent balance |
 | `ths logs [service] [-f]` | Stream or print service logs |
 | `ths list` | List known environments |
 | `ths stop` | Stop and delete the environment |

@@ -117,14 +117,14 @@ enum WalletCommand {
         #[arg(long, value_enum, default_value = "ironwood")]
         pool: Pool,
     },
-    /// Send funds from one development account (1-5) to another.
+    /// Send funds between development accounts or pools.
     Send(SendArgs),
-    /// Spend one account's transparent funds into another account's ironwood balance.
+    /// Spend transparent funds into an account's ironwood balance.
     Shield {
         /// Account index to shield from (1-5).
         #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
         from: u8,
-        /// Account index to shield into (1-5); must differ from --from.
+        /// Destination account index (1-5); may match --from.
         #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
         to: u8,
         /// Amount of ZEC to shield, up to 8 decimal places.
@@ -134,12 +134,12 @@ enum WalletCommand {
         #[arg(long, value_parser = parse_memo)]
         memo: Option<String>,
     },
-    /// Spend one account's ironwood funds into another account's transparent balance.
+    /// Spend ironwood funds into an account's transparent balance.
     Unshield {
         /// Account index to unshield from (1-5).
         #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
         from: u8,
-        /// Account index to unshield into (1-5); must differ from --from.
+        /// Destination account index (1-5); may match --from.
         #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
         to: u8,
         /// Amount of ZEC to unshield, up to 8 decimal places.
@@ -153,7 +153,7 @@ struct SendArgs {
     /// Source account index (1-5).
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
     from: u8,
-    /// Destination account index (1-5).
+    /// Destination account index (1-5); may match --from when pools differ.
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
     to: u8,
     /// Amount of ZEC to send, up to 8 decimal places.
@@ -274,8 +274,8 @@ fn main() -> Result<ExitCode> {
 }
 
 fn check_send(args: &SendArgs) -> Result<()> {
-    if args.from == args.to {
-        bail!("--from and --to must be different accounts");
+    if args.from == args.to && args.source_pool == args.destination_pool {
+        bail!("choose a different --to account or a different --destination-pool");
     }
     if args.memo.is_some() && args.destination_pool == Pool::Transparent {
         bail!(
@@ -573,6 +573,24 @@ mod tests {
             destination_pool,
             memo: memo.map(str::to_owned),
         }
+    }
+
+    #[test]
+    fn sends_allow_the_same_account_only_between_pools() {
+        for to in [1, 2] {
+            for source in [Pool::Ironwood, Pool::Transparent] {
+                for destination in [Pool::Ironwood, Pool::Transparent] {
+                    let mut args = send_args(1, to, destination, None);
+                    args.source_pool = source;
+                    assert_eq!(check_send(&args).is_ok(), to != 1 || source != destination);
+                }
+            }
+        }
+        let mut shield = send_args(1, 1, Pool::Ironwood, Some("memo"));
+        shield.source_pool = Pool::Transparent;
+        assert!(check_send(&shield).is_ok());
+        assert!(check_send(&send_args(1, 1, Pool::Transparent, Some("hi"))).is_err());
+        assert!(check_send(&send_args(1, 1, Pool::Transparent, Some(""))).is_err());
     }
 
     #[test]

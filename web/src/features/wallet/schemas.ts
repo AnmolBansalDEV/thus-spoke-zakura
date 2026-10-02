@@ -61,10 +61,14 @@ export const sendSchema = z
     amount: amountField,
     memo: memoField,
   })
-  .refine((values) => values.from_account !== values.to_account, {
-    message: 'Pick a different account — sending to yourself only costs the fee.',
-    path: ['to_account'],
-  })
+  .refine(
+    (values) =>
+      values.from_account !== values.to_account || values.source_pool !== values.destination_pool,
+    {
+      message: 'Choose a different account or a different destination pool.',
+      path: ['to_account'],
+    },
+  )
   .refine((values) => values.memo === '' || values.destination_pool === 'ironwood', {
     message: 'Transparent outputs cannot carry a memo. Choose the ironwood pool.',
     path: ['memo'],
