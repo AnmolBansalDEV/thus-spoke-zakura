@@ -173,9 +173,9 @@ Running `ths` with no command starts the default environment.
 | `ths faucet <ADDRESS>` | Send 1 disposable ZEC to a Regtest unified or transparent address |
 | `ths faucet <ADDRESS> --amount 2.5` | Send a custom amount of up to 5 disposable ZEC |
 | `ths wallet faucet --accounts 1,2,3 --amount 3` | Fund development accounts by index from the treasury |
-| `ths wallet send --from 1 --to 2 --amount 1 --memo "hi"` | Send between development accounts, with an optional Ironwood memo |
-| `ths wallet shield --from 1 --to 2 --amount 0.5` | Spend transparent funds into another account's Ironwood balance |
-| `ths wallet unshield --from 1 --to 2 --amount 0.2` | Spend Ironwood funds into another account's transparent balance |
+| `ths wallet send --from 1 --to 2 --amount 1 --memo "hi"` | Send between development accounts or pools, with an optional Ironwood memo |
+| `ths wallet shield --from 1 --to 2 --amount 0.5` | Spend transparent funds into the same or another account's Ironwood balance |
+| `ths wallet unshield --from 1 --to 2 --amount 0.2` | Spend Ironwood funds into the same or another account's transparent balance |
 | `ths logs app -f` | Follow dashboard/server logs |
 | `ths logs zakura -f` | Follow node logs |
 | `ths logs lightwalletd -f` | Follow lightwalletd logs |
@@ -270,6 +270,7 @@ cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact internal_address_faucets_record_confirmed_activity
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact internal_address_faucet_recovers_after_auto_mine_failure
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact external_address_faucet_behavior_is_unchanged
+cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact same_account_cross_pool_round_trip_is_replay_safe
 ```
 
 The first command compiles the integration target. The second runs its
@@ -287,6 +288,14 @@ node, then waits for the production background wallet-sync loop to update the
 existing activity row. Direct mining is intentional: retrying Send or using the
 server's mine endpoint would repair the row through a different path and would
 not prove background recovery.
+
+The same-account round-trip regression unshields 1,000,000 zatoshis from Account 1
+to its transparent pool, then shields 500,000 zatoshis back to Ironwood. It checks
+exact pool balances, Ironwood change, consumption of the received transparent
+output, transaction inclusion, and persisted activity. Replaying each request
+with the same idempotency key must leave balances, activity, and the chain tip
+unchanged. The exact fee and change expectations belong to this controlled
+single-note/single-UTXO fixture and pinned SDK.
 
 This is an integration test, not a mocked proof: image pull/build, wallet
 startup, and Ironwood proving make it materially slower and more resource-

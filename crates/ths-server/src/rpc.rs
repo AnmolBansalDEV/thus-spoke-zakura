@@ -36,8 +36,8 @@ pub struct ChainCheckpoint {
 
 #[derive(Debug, Deserialize, thiserror::Error)]
 #[error("RPC error {code}: {message}")]
-struct RpcError {
-    code: i64,
+pub struct RpcError {
+    pub code: i64,
     message: String,
 }
 
