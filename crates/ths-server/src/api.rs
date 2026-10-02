@@ -35,7 +35,7 @@ use crate::{
         Admission, MiningAdmissionError, MiningCoordinator, MiningJob, MiningRuntime, MiningState,
         validate_idempotency_key,
     },
-    rpc::{ChainCheckpoint, ChainInfo, NodeRpc},
+    rpc::{ChainCheckpoint, ChainInfo, NodeRpc, RpcError},
     wallet::{
         PaymentError, PreparedPayment, RealWallet, SendQuote, WALLET_BIRTHDAY_HEIGHT,
         regtest_network,
@@ -1323,7 +1323,12 @@ async fn seed(
     ))
 }
 async fn block(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
-    let mut block = state.0.rpc.block(&id).await?;
+    let mut block = state
+        .0
+        .rpc
+        .block(&id)
+        .await
+        .map_err(|e| not_found(e, NO_BLOCK))?;
     // `getblock` has no Ironwood root, but `z_gettreestate` does. The root is
     // an extra detail, so a failed lookup still returns the block.
     if let Some(hash) = block.get("hash").and_then(Value::as_str).map(str::to_owned) {
@@ -1431,7 +1436,12 @@ async fn transaction(
     State(state): State<AppState>,
     Path(txid): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    let mut tx = state.0.rpc.transaction(&txid).await?;
+    let mut tx = state
+        .0
+        .rpc
+        .transaction(&txid)
+        .await
+        .map_err(|e| not_found(e, NO_TRANSACTION))?;
     let mut prev_txs = std::collections::HashMap::new();
     for prev_id in transparent_prevout_ids(&tx) {
         if let Ok(prev) = state.0.rpc.transaction(&prev_id).await {
@@ -1467,11 +1477,40 @@ async fn search(
     if query.q.starts_with('t') {
         return address(State(state), Path(query.q)).await;
     }
-    if let Ok(block) = state.0.rpc.block(&query.q).await {
-        return Ok(Json(json!({"type":"block","value":block})));
+    // Only a 64-character hash can also be a txid; anything else is answered by the block lookup.
+    // Other node failures must surface rather than fall through to the transaction lookup.
+    match state.0.rpc.block(&query.q).await {
+        Ok(block) => return Ok(Json(json!({"type":"block","value":block}))),
+        Err(error) => {
+            let error = not_found(error, NO_BLOCK);
+            if query.q.len() != 64 || error.status != StatusCode::NOT_FOUND {
+                return Err(error);
+            }
+        }
     }
-    let tx = state.0.rpc.transaction(&query.q).await?;
+    let tx = state
+        .0
+        .rpc
+        .transaction(&query.q)
+        .await
+        .map_err(|e| not_found(e, NO_BLOCK_OR_TRANSACTION))?;
     Ok(Json(json!({"type":"transaction","value":tx})))
+}
+
+const NO_BLOCK: &str = "No block at that height or hash on this chain.";
+const NO_TRANSACTION: &str =
+    "No transaction with that ID on this chain. It may not have been mined yet.";
+const NO_BLOCK_OR_TRANSACTION: &str = "No block or transaction on this chain has that hash.";
+
+/// Zakura answers an unknown or unparseable block or transaction with -5 or -8.
+fn not_found(error: anyhow::Error, message: &str) -> ApiError {
+    match error.downcast_ref::<RpcError>().map(|error| error.code) {
+        Some(-5 | -8) => ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        },
+        _ => error.into(),
+    }
 }
 
 async fn events(
@@ -1573,13 +1612,13 @@ fn validate_send(req: &SendRequest) -> ApiResult<Option<MemoBytes>> {
     require_key(&req.idempotency_key)?;
     require_user_account(req.from_account)?;
     require_user_account(req.to_account)?;
-    if req.from_account == req.to_account {
-        return Err(ApiError::bad_request(
-            "from_account and to_account must be different accounts",
-        ));
-    }
     require_pool(&req.source_pool, "source_pool")?;
     require_pool(&req.destination_pool, "destination_pool")?;
+    if req.from_account == req.to_account && req.source_pool == req.destination_pool {
+        return Err(ApiError::bad_request(
+            "choose a different account or a different destination pool",
+        ));
+    }
     if req.amount_zatoshi == 0 || req.amount_zatoshi > MAX_MONEY {
         return Err(ApiError::bad_request(format!(
             "amount_zatoshi must be between 1 and {MAX_MONEY}"
@@ -2711,6 +2750,35 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn send_validation_allows_same_account_only_between_pools() {
+        for to in [1, 2] {
+            for source in ["ironwood", "transparent"] {
+                for destination in ["ironwood", "transparent"] {
+                    let mut body = valid_send();
+                    body["to_account"] = json!(to);
+                    body["source_pool"] = json!(source);
+                    body["destination_pool"] = json!(destination);
+                    let req = serde_json::from_value::<SendRequest>(body).unwrap();
+                    let result = validate_send(&req);
+                    if to == 1 && source == destination {
+                        let error = result.unwrap_err();
+                        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+                        assert_eq!(
+                            error.message,
+                            "choose a different account or a different destination pool"
+                        );
+                    } else {
+                        assert!(
+                            matches!(result, Ok(None)),
+                            "{to}: {source} -> {destination}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn invalid_sends_are_rejected_before_replay_or_synchronization() {
         let (state, _dir) = offline_state();
@@ -2740,7 +2808,34 @@ mod tests {
                 "treasury account",
                 with(&[("to_account", json!(TREASURY_ACCOUNT_ID))]),
             ),
-            ("same account", with(&[("to_account", json!(1))])),
+            ("same account and pool", with(&[("to_account", json!(1))])),
+            (
+                "same account and transparent pool",
+                with(&[
+                    ("to_account", json!(1)),
+                    ("source_pool", json!("transparent")),
+                    ("destination_pool", json!("transparent")),
+                ]),
+            ),
+            (
+                "same account and unsupported source",
+                with(&[("to_account", json!(1)), ("source_pool", json!("sapling"))]),
+            ),
+            (
+                "same account and unsupported destination",
+                with(&[
+                    ("to_account", json!(1)),
+                    ("destination_pool", json!("orchard")),
+                ]),
+            ),
+            (
+                "same account unshield with memo",
+                with(&[
+                    ("to_account", json!(1)),
+                    ("destination_pool", json!("transparent")),
+                    ("memo", json!("hi")),
+                ]),
+            ),
             (
                 "bad source pool",
                 with(&[("source_pool", json!("sapling"))]),
@@ -2780,6 +2875,54 @@ mod tests {
                 .id,
             original.id
         );
+    }
+
+    #[tokio::test]
+    async fn same_account_cross_pool_replays_preserve_activity_and_identity() {
+        for (source, destination) in [("ironwood", "transparent"), ("transparent", "ironwood")] {
+            let (state, _dir) = offline_state();
+            let original = state
+                .0
+                .store
+                .claim_transfer(1, 1, source, destination, 100_000, REPLAY_KEY, None)
+                .unwrap();
+            state
+                .0
+                .store
+                .record_prepared(&original.id, "txid", b"signed transaction", 0)
+                .unwrap();
+            state.0.store.mark_broadcast(&original.id, "txid").unwrap();
+            state
+                .0
+                .store
+                .confirm(&original.id, "txid", &"c".repeat(64))
+                .unwrap();
+            let before = activity_ids(&state);
+            let mut body = valid_send();
+            body["to_account"] = json!(1);
+            body["source_pool"] = json!(source);
+            body["destination_pool"] = json!(destination);
+            for _ in 0..2 {
+                let (status, response) = post_send(&state, &body).await;
+                assert_eq!(status, StatusCode::OK, "{response}");
+                assert_eq!(response["id"], original.id);
+                assert_eq!(response["txid"], "txid");
+                assert_eq!(response["from_account"], 1);
+                assert_eq!(response["to_account"], 1);
+                assert_eq!(response["source_pool"], source);
+                assert_eq!(response["destination_pool"], destination);
+            }
+            for changed in [("amount_zatoshi", json!(100_001)), ("to_account", json!(2))] {
+                let mut conflict = body.clone();
+                conflict[changed.0] = changed.1;
+                assert_eq!(post_send(&state, &conflict).await.0, StatusCode::CONFLICT);
+            }
+            let mut reverse = body.clone();
+            reverse["source_pool"] = json!(destination);
+            reverse["destination_pool"] = json!(source);
+            assert_eq!(post_send(&state, &reverse).await.0, StatusCode::CONFLICT);
+            assert_eq!(activity_ids(&state), before);
+        }
     }
 
     #[tokio::test]
@@ -2856,6 +2999,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn explorer_reports_unknown_blocks_and_transactions_as_404() {
+        // A node that knows nothing, answering with Zakura's not-found codes.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node = format!("http://{}", listener.local_addr().unwrap());
+        let not_found = Router::new().route(
+            "/",
+            post(|Json(req): Json<Value>| async move {
+                let code = if req["method"] == "getblock" { -8 } else { -5 };
+                Json(json!({"error": {"code": code, "message": "not found"}}))
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, not_found).await });
+
+        let (state, _dir) = state_with_local_wallet();
+        let state = AppState::new(
+            state.0.store.clone(),
+            state.0.wallet.clone(),
+            node,
+            "test".into(),
+        );
+        let hash = "a".repeat(64);
+        for path in [
+            "/api/v1/blocks/999999".to_owned(),
+            format!("/api/v1/transactions/{hash}"),
+            "/api/v1/search?q=999999".to_owned(),
+            format!("/api/v1/search?q={hash}"),
+        ] {
+            let response = router(state.clone())
+                .oneshot(Request::get(&path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn search_does_not_mask_a_block_node_failure_as_404() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node = format!("http://{}", listener.local_addr().unwrap());
+        let failing = Router::new().route(
+            "/",
+            post(|Json(req): Json<Value>| async move {
+                let code = if req["method"] == "getblock" { -28 } else { -5 };
+                Json(json!({"error": {"code": code, "message": "injected"}}))
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, failing).await });
+
+        let (state, _dir) = state_with_local_wallet();
+        let state = AppState::new(
+            state.0.store.clone(),
+            state.0.wallet.clone(),
+            node,
+            "t".into(),
+        );
+        let uri = format!("/api/v1/search?q={}", "a".repeat(64));
+        let response = router(state)
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
@@ -3103,38 +3310,44 @@ mod tests {
 
     #[tokio::test]
     async fn retry_submits_the_same_prepared_transaction_after_a_lost_response() {
-        let store = Store::open(":memory:").unwrap();
-        store.initialize().unwrap();
-        let claim = store
-            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
-            .unwrap();
-        store
-            .record_prepared(&claim.id, "real-txid", b"signed transaction", 140)
-            .unwrap();
-        let prepared = store.activity_for_key("same").unwrap().unwrap();
-        let runtime = RecordingPaymentSubmitter {
-            lookups: Mutex::new(VecDeque::from([
-                Ok(false),
-                Err("node unavailable"),
-                Ok(false),
-            ])),
-            height: AtomicU64::new(139),
-            fail_next: AtomicBool::new(true),
-            ..Default::default()
-        };
+        for (to, source, destination) in [
+            (2, "ironwood", "ironwood"),
+            (1, "ironwood", "transparent"),
+            (1, "transparent", "ironwood"),
+        ] {
+            let store = Store::open(":memory:").unwrap();
+            store.initialize().unwrap();
+            let claim = store
+                .claim_transfer(1, to, source, destination, 12_000, "same", None)
+                .unwrap();
+            store
+                .record_prepared(&claim.id, "real-txid", b"signed transaction", 140)
+                .unwrap();
+            let prepared = store.activity_for_key("same").unwrap().unwrap();
+            let runtime = RecordingPaymentSubmitter {
+                lookups: Mutex::new(VecDeque::from([
+                    Ok(false),
+                    Err("node unavailable"),
+                    Ok(false),
+                ])),
+                height: AtomicU64::new(139),
+                fail_next: AtomicBool::new(true),
+                ..Default::default()
+            };
 
-        assert!(submit_prepared(&store, &runtime, &prepared).await.is_err());
-        assert_eq!(
-            store.activity_for_key("same").unwrap().unwrap().status,
-            "prepared"
-        );
+            assert!(submit_prepared(&store, &runtime, &prepared).await.is_err());
+            assert_eq!(
+                store.activity_for_key("same").unwrap().unwrap().status,
+                "prepared"
+            );
 
-        let broadcast = submit_prepared(&store, &runtime, &prepared).await.unwrap();
-        assert!(matches!(broadcast, PreparedSubmission::Broadcast(_)));
-        assert_eq!(
-            runtime.broadcasts.into_inner().unwrap(),
-            [b"signed transaction", b"signed transaction"]
-        );
+            let broadcast = submit_prepared(&store, &runtime, &prepared).await.unwrap();
+            assert!(matches!(broadcast, PreparedSubmission::Broadcast(_)));
+            assert_eq!(
+                runtime.broadcasts.into_inner().unwrap(),
+                [b"signed transaction", b"signed transaction"]
+            );
+        }
     }
 
     #[tokio::test]

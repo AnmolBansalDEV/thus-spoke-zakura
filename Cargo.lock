@@ -2944,6 +2944,7 @@ dependencies = [
  "clap",
  "futures-core",
  "futures-util",
+ "h2",
  "hex",
  "rand 0.10.2",
  "reqwest",

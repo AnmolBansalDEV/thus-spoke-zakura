@@ -37,7 +37,10 @@ use zcash_client_backend::{
     proposal::Proposal,
     proto::{
         compact_formats::CompactBlock,
-        service::{ChainSpec, RawTransaction, compact_tx_streamer_client::CompactTxStreamerClient},
+        service::{
+            ChainSpec, RawTransaction, SendResponse,
+            compact_tx_streamer_client::CompactTxStreamerClient,
+        },
     },
     wallet::{OvkPolicy, WalletTransparentOutput},
 };
@@ -72,6 +75,7 @@ use crate::rpc::ChainCheckpoint;
 mod recovery;
 
 type Db = WalletDb<rusqlite::Connection, LocalNetwork, SystemClock, UnwrapErr<SysRng>>;
+const LIGHTWALLETD_BROADCAST_TIMEOUT: Duration = Duration::from_secs(30);
 
 const PREPARED_PAYMENTS_MIGRATION_ID: Uuid =
     Uuid::from_u128(0x695f93ac_6935_47e8_8f06_017b1d7ec3aa);
@@ -803,14 +807,7 @@ impl RealWallet {
     }
 
     pub async fn broadcast(&self, raw_transaction: &[u8]) -> Result<()> {
-        let mut client = CompactTxStreamerClient::connect(self.lightwalletd.clone()).await?;
-        let result = client
-            .send_transaction(RawTransaction {
-                data: raw_transaction.to_vec(),
-                height: 0,
-            })
-            .await?
-            .into_inner();
+        let result = self.send_transaction(raw_transaction.to_vec()).await?;
         if result.error_code != 0 {
             bail!(
                 "lightwalletd rejected transaction: {}",
@@ -818,6 +815,20 @@ impl RealWallet {
             );
         }
         Ok(())
+    }
+
+    async fn send_transaction(&self, data: Vec<u8>) -> Result<SendResponse> {
+        tokio::time::timeout(LIGHTWALLETD_BROADCAST_TIMEOUT, async {
+            let mut client = CompactTxStreamerClient::connect(self.lightwalletd.clone()).await?;
+            Ok::<_, anyhow::Error>(
+                client
+                    .send_transaction(RawTransaction { data, height: 0 })
+                    .await?
+                    .into_inner(),
+            )
+        })
+        .await
+        .context("lightwalletd transaction broadcast timed out")?
     }
 
     /// Returns the exact fee and maximum spendable amount for emptying a pool.
@@ -1030,14 +1041,7 @@ impl RealWallet {
                 Ok((txid.to_string(), raw))
             })
             .await?;
-        let mut client = CompactTxStreamerClient::connect(self.lightwalletd.clone()).await?;
-        let response = client
-            .send_transaction(RawTransaction {
-                data: raw,
-                height: 0,
-            })
-            .await?
-            .into_inner();
+        let response = self.send_transaction(raw).await?;
         if response.error_code != 0 {
             bail!(
                 "lightwalletd rejected shielding: {}",
@@ -1151,6 +1155,44 @@ mod treasury_sync_tests {
 
         assert!(result.is_ok(), "height wait ignored its deadline");
         assert!(result.unwrap().is_err());
+    }
+
+    #[tokio::test]
+    async fn broadcast_times_out_after_lightwalletd_accepts_the_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut connection = h2::server::handshake(socket).await.unwrap();
+            let (request, response) = connection.accept().await.unwrap().unwrap();
+            assert_eq!(
+                request.uri().path(),
+                "/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction"
+            );
+            accepted_tx.send(()).unwrap();
+            let _response = response;
+            std::future::pending::<()>().await;
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("server.db")).unwrap();
+        store.initialize().unwrap();
+        let mut wallet = RealWallet::open(dir.path(), &store.seed().unwrap()).unwrap();
+        wallet.lightwalletd = endpoint;
+        let broadcast = tokio::spawn(async move { wallet.broadcast(&[1, 2, 3]).await });
+
+        tokio::time::timeout(Duration::from_secs(5), accepted_rx)
+            .await
+            .expect("lightwalletd never received the broadcast")
+            .unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(31)).await;
+        tokio::task::yield_now().await;
+        assert!(broadcast.is_finished(), "broadcast ignored its deadline");
+        let error = broadcast.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        server.abort();
     }
 
     #[tokio::test]
