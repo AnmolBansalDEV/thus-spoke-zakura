@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient, type UseMutationResult } from '@tanstack/react-query';
-import { api, idempotencyKey, type Activity, type Pool } from '@/lib/api';
+import { api, idempotencyKey, type Activity, type MiningJob, type Pool } from '@/lib/api';
 import { queryKeys } from './queries';
 
 /** Everything a successful money movement invalidates. */
@@ -95,5 +95,27 @@ export function useMine(): UseMutationResult<{ blocks: number }, Error, number> 
   return useMutation({
     mutationFn: (blocks: number) => api.mine(blocks),
     onSuccess: invalidate,
+  });
+}
+
+export function useStartMining(): UseMutationResult<MiningJob, Error, number> {
+  const queryClient = useQueryClient();
+  const operation = operationKey('mine', (blocks: number) => String(blocks));
+  return useMutation({
+    mutationFn: (blocks: number) => {
+      const state = queryClient.getQueryData<{ job: MiningJob | null }>(queryKeys.mining)?.job
+        ?.state;
+      if (state === 'completed' || state === 'failed') operation.clear(blocks);
+      return api.startMining(blocks, operation.keyFor(blocks));
+    },
+    retry: false,
+    onSuccess: async (job, blocks) => {
+      operation.clear(blocks);
+      queryClient.setQueryData(queryKeys.mining, { job });
+      await queryClient.invalidateQueries({ queryKey: queryKeys.mining });
+    },
+    onError: async () => {
+      await queryClient.invalidateQueries({ queryKey: queryKeys.mining });
+    },
   });
 }
