@@ -76,10 +76,10 @@ Select **Send ZEC** or the **Send** button on an account card. Choose the source
 account, destination account, pool, and amount. The resulting transaction is
 mined automatically and appears under **Recent activity**.
 
-You can use Orchard or transparent balances to exercise different transaction
+You can use Ironwood or transparent balances to exercise different transaction
 routes.
 
-When the destination pool is Orchard, you can add an optional memo of up to
+When the destination pool is Ironwood, you can add an optional memo of up to
 512 bytes. It is encrypted to the recipient and never shown in the explorer.
 Transparent outputs cannot carry a memo, so the field is disabled for them.
 
@@ -173,9 +173,9 @@ Running `ths` with no command starts the default environment.
 | `ths faucet <ADDRESS>` | Send 1 disposable ZEC to a Regtest unified or transparent address |
 | `ths faucet <ADDRESS> --amount 2.5` | Send a custom amount of up to 5 disposable ZEC |
 | `ths wallet faucet --accounts 1,2,3 --amount 3` | Fund development accounts by index from the treasury |
-| `ths wallet send --from 1 --to 2 --amount 1 --memo "hi"` | Send between development accounts, with an optional Orchard memo |
-| `ths wallet shield --from 1 --to 2 --amount 0.5` | Spend transparent funds into another account's Orchard balance |
-| `ths wallet unshield --from 1 --to 2 --amount 0.2` | Spend Orchard funds into another account's transparent balance |
+| `ths wallet send --from 1 --to 2 --amount 1 --memo "hi"` | Send between development accounts, with an optional Ironwood memo |
+| `ths wallet shield --from 1 --to 2 --amount 0.5` | Spend transparent funds into another account's Ironwood balance |
+| `ths wallet unshield --from 1 --to 2 --amount 0.2` | Spend Ironwood funds into another account's transparent balance |
 | `ths logs app -f` | Follow dashboard/server logs |
 | `ths logs zakura -f` | Follow node logs |
 | `ths logs lightwalletd -f` | Follow lightwalletd logs |
@@ -252,9 +252,9 @@ every push and pull request. It is separate from the normal Rust and web jobs:
 scenario works.
 
 Run the following from the repository root. It requires Rust 1.98.0, a running
-Docker daemon, network access to pull `zakuracore/zakura:1.4.0`, and enough
+Docker daemon, network access to pull `zakuracore/zakura:1.6.0`, and enough
 local CPU, memory, and time to build the existing pinned lightwalletd image and
-create a real Orchard proof. The Rust Cargo integration target is the only test
+create a real Ironwood proof. The Rust Cargo integration target is the only test
 runner: the normal Cargo invocation runs Docker-free helper tests while the
 live test remains ignored until explicitly selected. The node and lightwalletd
 remain real external services for that explicit invocation.
@@ -263,7 +263,7 @@ remain real external services for that explicit invocation.
 cargo test --locked --profile dev-runtime -p tsz-server --test activity_recovery --no-run
 cargo test --locked --profile dev-runtime -p tsz-server --test activity_recovery
 # The preceding command runs helper tests; the live test remains ignored.
-docker pull zakuracore/zakura:1.4.0
+docker pull zakuracore/zakura:1.6.0
 docker build -f docker/lightwalletd.Dockerfile -t tsz-recovery-lightwalletd:local .
 cargo test --locked --profile dev-runtime -p tsz-server --test activity_recovery -- --ignored --exact broadcast_recovers_after_auto_mine_failure
 cargo test --locked --profile dev-runtime -p tsz-server --test activity_recovery -- --ignored --exact concurrent_identical_sends_have_one_chain_effect
@@ -278,7 +278,7 @@ target with the matching source-built `tsz-server` binary, including when
 The live test owns a UUID-prefixed `tsz-recovery-*` Docker network, containers,
 and volumes, plus private temporary data/configuration directories, a local RPC
 proxy, and a local server process. It sends a genuine 1,000,000-zatoshi (0.01
-ZEC) Orchard payment from Account 1 to Account 2, deliberately rejects exactly
+ZEC) Ironwood payment from Account 1 to Account 2, deliberately rejects exactly
 one automatic `generate([1])` through the proxy, mines directly through the
 node, then waits for the production background wallet-sync loop to update the
 existing activity row. Direct mining is intentional: retrying Send or using the
@@ -286,7 +286,7 @@ server's mine endpoint would repair the row through a different path and would
 not prove background recovery.
 
 This is an integration test, not a mocked proof: image pull/build, wallet
-startup, and Orchard proving make it materially slower and more resource-
+startup, and Ironwood proving make it materially slower and more resource-
 intensive than the helper suite. Its fixture removes only exact resources it
 registered, stops and reaps its child server, shuts down the proxy, and returns
 nonzero for a timeout or cleanup failure. It never prunes shared Docker state.
@@ -312,7 +312,12 @@ Browser ──HTTP/SSE── tsz-server ──JSON-RPC── Zakura (Regtest)
 
 The server owns wallet synchronization and exposes the latest confirmed wallet
 snapshot to the dashboard. A hidden sixth account acts as the mining and faucet
-treasury. Account 1 starts with 5 Orchard ZEC, so you can experiment immediately.
+treasury. Account 1 starts with 5 Ironwood ZEC, so you can experiment immediately.
+
+The local chain activates every network upgrade through NU6.3 at height 1, so it
+follows mainnet's current consensus rules. Shielded funds live in the Ironwood
+pool. The Orchard pool stopped accepting deposits at NU6.3, so the wallet API
+rejects `orchard` as a pool.
 
 The launcher chooses exact versioned images, labels every Docker resource by
 instance, and never binds a service beyond loopback.

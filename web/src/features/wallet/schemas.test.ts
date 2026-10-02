@@ -4,8 +4,8 @@ import { sendSchema } from './schemas';
 const base = {
   from_account: '1',
   to_account: '2',
-  source_pool: 'orchard' as const,
-  destination_pool: 'orchard' as const,
+  source_pool: 'ironwood' as const,
+  destination_pool: 'ironwood' as const,
   amount: '1',
   memo: '',
 };
@@ -37,7 +37,7 @@ describe('sendSchema', () => {
     }
   });
 
-  it('accepts a memo to an orchard destination', () => {
+  it('accepts a memo to an ironwood destination', () => {
     expect(memoIssue({ ...base, memo: 'rent for October' })).toBeUndefined();
     expect(sendSchema.safeParse({ ...base, memo: 'rent for October' }).success).toBe(true);
   });

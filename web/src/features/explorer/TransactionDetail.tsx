@@ -10,7 +10,7 @@ import { useTransaction } from '@/hooks/queries';
 import { errorMessage, type TxInput } from '@/lib/api';
 import { formatZecAmount } from '@/lib/money';
 import { chainTime, shortHash } from '@/lib/format';
-import { summariseShielding } from './shielding';
+import { actionSummary, summariseShielding } from './shielding';
 import { resolveTransparentInput } from './resolve-input';
 import { Stat } from '@/components/ui/Stat';
 import { BACK_LINK } from './back-link';
@@ -114,9 +114,9 @@ export function TransactionDetail() {
 
       <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <Stat
-          label="Orchard actions"
-          value={String(shielding.orchardActions)}
-          tone={shielding.orchardActions > 0 ? 'accent' : 'muted'}
+          label="Shielded actions"
+          value={String(shielding.shieldedActions)}
+          tone={shielding.shieldedActions > 0 ? 'accent' : 'muted'}
         />
         <Stat
           label="Block"
@@ -136,9 +136,8 @@ export function TransactionDetail() {
               <b className="text-accent-strong block text-[13px]">Nothing is public</b>
               <p className="text-ink-muted mt-1 text-[12px] leading-relaxed">
                 No transparent inputs, no transparent outputs, and a zero value balance. The sender,
-                recipient and amount exist only inside {shielding.orchardActions} Orchard action
-                {shielding.orchardActions === 1 ? '' : 's'}. Your wallet can display this transfer
-                because it holds the viewing keys; nobody else can.
+                recipient and amount exist only inside {actionSummary(shielding)}. Your wallet can
+                display this transfer because it holds the viewing keys; nobody else can.
               </p>
             </div>
           </div>
@@ -150,10 +149,9 @@ export function TransactionDetail() {
             <div>
               <b className="text-accent-strong block text-[13px]">Only the fee is public</b>
               <p className="text-ink-muted mt-1 text-[12px] leading-relaxed">
-                Sender, recipient and amount stay inside {shielding.orchardActions} Orchard action
-                {shielding.orchardActions === 1 ? '' : 's'}. The pool value balance of{' '}
-                {formatZecAmount(BigInt(Math.abs(shielding.valueBalanceZat)))} is public chain data,
-                because the network has to see the fee to verify the transaction.
+                Sender, recipient and amount stay inside {actionSummary(shielding)}. The pool value
+                balance of {formatZecAmount(BigInt(Math.abs(shielding.valueBalanceZat)))} is public
+                chain data, because the network has to see the fee to verify the transaction.
               </p>
             </div>
           </div>
@@ -172,11 +170,21 @@ export function TransactionDetail() {
           </div>
         )}
 
+        {/* Ironwood and transparent always; other pools only when the transaction uses
+            them (this chain activates NU6.3 at height 1, so they're usually empty). */}
         <dl>
-          <DataRow label="Orchard actions">{shielding.orchardActions}</DataRow>
+          <DataRow label="Ironwood actions">{shielding.ironwoodActions}</DataRow>
+          {shielding.orchardActions > 0 && (
+            <DataRow label="Orchard actions">{shielding.orchardActions}</DataRow>
+          )}
+          {shielding.saplingSpends > 0 && (
+            <DataRow label="Sapling spends">{shielding.saplingSpends}</DataRow>
+          )}
+          {shielding.saplingOutputs > 0 && (
+            <DataRow label="Sapling outputs">{shielding.saplingOutputs}</DataRow>
+          )}
           <DataRow label="Transparent inputs">{shielding.transparentInputs}</DataRow>
           <DataRow label="Transparent outputs">{shielding.transparentOutputs}</DataRow>
-          <DataRow label="Sapling">{shielding.saplingSpends + shielding.saplingOutputs}</DataRow>
         </dl>
 
         {!shielding.shieldedOnly && !shielding.mixed && (

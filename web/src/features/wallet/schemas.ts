@@ -8,7 +8,7 @@ export const FAUCET_MAX_ZATOSHI = 5n * ZATOSHIS_PER_ZEC;
 export const MINE_MIN_BLOCKS = 1;
 export const MINE_MAX_BLOCKS = 10_000;
 
-const poolField = z.enum(['transparent', 'orchard']);
+const poolField = z.enum(['transparent', 'ironwood']);
 
 /** Selects and inputs hand back strings; the schema owns the conversion. */
 const accountIdField = z
@@ -65,8 +65,8 @@ export const sendSchema = z
     message: 'Pick a different account — sending to yourself only costs the fee.',
     path: ['to_account'],
   })
-  .refine((values) => values.memo === '' || values.destination_pool === 'orchard', {
-    message: 'Transparent outputs cannot carry a memo. Choose the orchard pool.',
+  .refine((values) => values.memo === '' || values.destination_pool === 'ironwood', {
+    message: 'Transparent outputs cannot carry a memo. Choose the ironwood pool.',
     path: ['memo'],
   });
 export type SendInput = z.input<typeof sendSchema>;
