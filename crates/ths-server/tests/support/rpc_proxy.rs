@@ -67,7 +67,7 @@ impl FallbackTaskReaper {
         let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
         let (completion_sender, completion) = std::sync::mpsc::sync_channel(1);
         let thread = std::thread::Builder::new()
-            .name("tsz-recovery-proxy-reaper".to_owned())
+            .name("ths-recovery-proxy-reaper".to_owned())
             .spawn(move || {
                 let runtime = match tokio::runtime::Builder::new_current_thread()
                     .enable_time()

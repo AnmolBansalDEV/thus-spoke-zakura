@@ -18,7 +18,7 @@ use db::{Store, TREASURY_ACCOUNT_ID};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "tsz-server", version)]
+#[command(name = "ths-server", version)]
 struct Args {
     #[command(subcommand)]
     command: Command,
@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "tsz_server=info,tower_http=info".into()),
+                .unwrap_or_else(|_| "ths_server=info,tower_http=info".into()),
         )
         .init();
     match Args::parse().command {
@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
 fn init(data_dir: PathBuf, config_dir: PathBuf) -> Result<()> {
     fs::create_dir_all(&data_dir)?;
     fs::create_dir_all(&config_dir)?;
-    let store = Store::open(data_dir.join("tsz.db"))?;
+    let store = Store::open(data_dir.join("ths.db"))?;
     store.initialize()?;
     wallet::RealWallet::open(&data_dir, &store.seed()?)?;
     let miner = store.account(TREASURY_ACCOUNT_ID)?.transparent_address;
@@ -132,14 +132,14 @@ extra_coinbase_data = "thus-spoke-zakura"
 
 async fn serve(data_dir: PathBuf) -> Result<()> {
     fs::create_dir_all(&data_dir)?;
-    let store = Store::open(data_dir.join("tsz.db"))?;
+    let store = Store::open(data_dir.join("ths.db"))?;
     store.initialize()?;
     let wallet = wallet::RealWallet::open(&data_dir, &store.seed()?)?;
     let state = api::AppState::new(
         store,
         wallet,
-        std::env::var("TSZ_ZAKURA_RPC").unwrap_or_else(|_| "http://127.0.0.1:18232".into()),
-        std::env::var("TSZ_INSTANCE").unwrap_or_else(|_| "default".into()),
+        std::env::var("THS_ZAKURA_RPC").unwrap_or_else(|_| "http://127.0.0.1:18232".into()),
+        std::env::var("THS_INSTANCE").unwrap_or_else(|_| "default".into()),
     );
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
@@ -157,10 +157,10 @@ async fn serve(data_dir: PathBuf) -> Result<()> {
         .context("provisioning Account 1 with 5 Ironwood ZEC")?;
     tokio::spawn(api::wallet_sync_loop(state.clone()));
     let app = api::router(state);
-    let address: SocketAddr = std::env::var("TSZ_LISTEN")
+    let address: SocketAddr = std::env::var("THS_LISTEN")
         .unwrap_or_else(|_| "127.0.0.1:8080".into())
         .parse()
-        .context("invalid TSZ_LISTEN")?;
+        .context("invalid THS_LISTEN")?;
     tracing::info!(%address, "dashboard ready");
     let listener = tokio::net::TcpListener::bind(address).await?;
     axum::serve(listener, app).await?;
