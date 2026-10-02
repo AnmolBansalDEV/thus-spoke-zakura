@@ -252,7 +252,7 @@ every push and pull request. It is separate from the normal Rust and web jobs:
 scenario works.
 
 Run the following from the repository root. It requires Rust 1.98.0, a running
-Docker daemon, network access to pull `zakuracore/zakura:1.4.0`, and enough
+Docker daemon, network access to pull `zakuracore/zakura:1.6.0`, and enough
 local CPU, memory, and time to build the existing pinned lightwalletd image and
 create a real Ironwood proof. The Rust Cargo integration target is the only test
 runner: the normal Cargo invocation runs Docker-free helper tests while the
@@ -263,7 +263,7 @@ remain real external services for that explicit invocation.
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery --no-run
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery
 # The preceding command runs helper tests; the live test remains ignored.
-docker pull zakuracore/zakura:1.4.0
+docker pull zakuracore/zakura:1.6.0
 docker build -f docker/lightwalletd.Dockerfile -t ths-recovery-lightwalletd:local .
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact broadcast_recovers_after_auto_mine_failure
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact concurrent_identical_sends_have_one_chain_effect

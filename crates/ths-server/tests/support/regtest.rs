@@ -449,7 +449,7 @@ impl RegtestStack {
                 "GID=0".into(),
                 "--publish".into(),
                 "127.0.0.1::18232".into(),
-                "zakuracore/zakura:1.4.0".into(),
+                "zakuracore/zakura:1.6.0".into(),
                 "zakurad".into(),
                 "start".into(),
             ],
@@ -1520,7 +1520,7 @@ mod tests {
             if args.first().is_some_and(|argument| argument == "run")
                 && args
                     .iter()
-                    .any(|argument| argument == "zakuracore/zakura:1.4.0")
+                    .any(|argument| argument == "zakuracore/zakura:1.6.0")
                 && self.fail_node_run.load(Ordering::SeqCst)
             {
                 return Ok(CommandOutput {
