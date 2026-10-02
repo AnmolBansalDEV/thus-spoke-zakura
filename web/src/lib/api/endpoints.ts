@@ -7,6 +7,8 @@ import {
   blockPageSchema,
   blockSchema,
   mempoolSchema,
+  miningJobSchema,
+  miningJobResponseSchema,
   seedSchema,
   sendQuoteSchema,
   statusSchema,
@@ -74,6 +76,13 @@ export const api = {
 
   mine: (blocks: number) =>
     post('/mine', z.object({ blocks: z.number(), hashes: z.array(z.string()) }), { blocks }),
+
+  startMining: (blocks: number, idempotency_key: string) =>
+    post('/mining/jobs', miningJobSchema, { blocks, idempotency_key }),
+
+  miningJob: () => request('/mining/jobs', miningJobResponseSchema),
+
+  miningJobById: (id: string) => request(`/mining/jobs/${encodeURIComponent(id)}`, miningJobSchema),
 
   seed: () =>
     post('/dev/seed', seedSchema, {

@@ -97,6 +97,39 @@ Select **Mine** from any dashboard page and enter the number of blocks. This is
 useful when testing confirmations, expiry, coinbase maturity, or code that
 reacts to new blocks.
 
+Mining runs in the server. You can dismiss the dialog, navigate to another page,
+refresh, or close the tab while it runs. The dashboard restores the latest job
+and its confirmed progress when you return. Only one manual job can run at a
+time, including wallet synchronization. Payment and faucet confirmation mining
+can interleave; those blocks do not count toward the manual request.
+
+Progress counts hashes acknowledged for this job. If a mining RPC fails, extra
+blocks may have committed without a usable response. The dashboard then shows a
+lower-bound count and uncertain progress; the server never automatically retries
+that RPC. A wallet synchronization failure after mining reports the full mined
+count separately from the synchronization error.
+
+The dashboard uses these job endpoints:
+
+| Endpoint | Behavior |
+| --- | --- |
+| `POST /api/v1/mining/jobs` | Accept `{blocks, idempotency_key}` and return the job with HTTP 202 |
+| `GET /api/v1/mining/jobs` | Return `{job}` for the latest job, or `{job: null}` |
+| `GET /api/v1/mining/jobs/{id}` | Return a retained job, or HTTP 404 |
+
+Reusing an accepted key with the same block count returns the same job. A changed
+count for that key or a different request during an active manual job returns
+HTTP 409. The server retains at most 1,024 jobs and their keys for its process
+lifetime. At capacity, it rejects new admissions with HTTP 503 while reads and
+existing-key replays remain available. Stopping the server cancels running work
+and discards the history; jobs are not recovered after restart.
+
+`ths mine` still waits for the server-owned job and wallet synchronization before
+reporting success. Its HTTP client times out after 300 seconds, but an admitted
+job continues after that timeout or a client disconnection. Inspect the latest
+job before issuing another command. Each legacy request uses a fresh internal
+key, so repeating a command after completion starts another job.
+
 ![Mine blocks on the local Regtest network](docs/images/mine.png)
 
 ### Explore blocks and transactions

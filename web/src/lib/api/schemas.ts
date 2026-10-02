@@ -226,3 +226,16 @@ export const seedSchema = z.object({ seed_hex: z.string(), warning: z.string() }
 export const apiErrorSchema = z.object({
   error: z.object({ message: z.string(), status: z.number().int() }),
 });
+
+export const miningJobSchema = z
+  .object({
+    id: z.string().uuid(),
+    requested_blocks: z.number().int().min(1).max(10_000),
+    completed_blocks: z.number().int().nonnegative(),
+    state: z.enum(['mining', 'syncing', 'completed', 'failed']),
+    error: z.string().nullable(),
+    progress_uncertain: z.boolean(),
+  })
+  .refine((job) => job.completed_blocks <= job.requested_blocks);
+export type MiningJob = z.infer<typeof miningJobSchema>;
+export const miningJobResponseSchema = z.object({ job: miningJobSchema.nullable() });

@@ -162,6 +162,34 @@ ths mine 1
 ths mine 10 --json
 ```
 
+The command keeps the legacy `POST /api/v1/mine` input `{blocks}` and successful
+output `{blocks, hashes}`. Mining belongs to the server and continues if the
+client disconnects or the command's 300-second HTTP timeout expires. Before
+issuing another mining command after a timeout, inspect the latest job with
+`GET /api/v1/mining/jobs` at the dashboard endpoint shown by `ths endpoints`.
+Each legacy request uses a fresh internal key: repeating a completed command
+mines another set of blocks. A different manual request during mining or wallet
+synchronization is rejected with HTTP 409.
+
+Dashboard jobs use `POST /api/v1/mining/jobs` with `{blocks, idempotency_key}`;
+acceptance returns HTTP 202. Replaying an accepted key with the same count returns
+the same job, including after completion or failure. Reusing that key with a
+different count returns HTTP 409. Read the latest job through
+`GET /api/v1/mining/jobs` or a retained job through `GET /api/v1/mining/jobs/{id}`.
+The dashboard restores progress after refresh, navigation, modal dismissal, or
+closing and reopening a tab.
+
+Progress counts only acknowledged hashes from that job, excluding interleaved
+payment or faucet mining. A failed mining RPC may have committed extra blocks;
+its confirmed count is a lower bound and the server never automatically retries
+the uncertain RPC. A wallet synchronization failure after mining retains the
+full mined count and reports the synchronization error separately.
+
+Job history and keys last only for the server process lifetime, with a limit of
+1,024 jobs and no key eviction. At capacity, new admissions return HTTP 503;
+existing-key replays and reads continue. Stopping the server cancels running work
+and discards this history. Jobs and deduplication do not survive a restart.
+
 ---
 
 ## Funding an address: `ths faucet <ADDRESS> [--amount <ZEC>]`

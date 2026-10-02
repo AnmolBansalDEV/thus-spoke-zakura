@@ -18,6 +18,7 @@ const TOPICS: Record<string, readonly unknown[][]> = {
     ['address'],
   ],
   sync: [[...queryKeys.status]],
+  mining: [[...queryKeys.mining]],
 };
 
 export function useServerEvents(): void {
