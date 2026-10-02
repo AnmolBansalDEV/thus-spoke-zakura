@@ -166,4 +166,53 @@ describe('MineDialog', () => {
     expect(keys[0]).toBe(keys[1]);
     expect(fetchSpy).toHaveBeenCalled();
   });
+
+  it.each(['completed', 'failed'] as const)(
+    'starts a new same-count job after a lost response and %s job',
+    async (state) => {
+      const bodies: string[] = [];
+      let job: MiningJob | null = null;
+      vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+        await Promise.resolve();
+        if (init?.method === 'POST') {
+          bodies.push(typeof init.body === 'string' ? init.body : '{}');
+          if (bodies.length === 1) {
+            job = { ...running, requested_blocks: 1, completed_blocks: 1, state };
+            throw new TypeError('response lost');
+          }
+          const firstKey = (JSON.parse(bodies[0] ?? '{}') as { idempotency_key: string })
+            .idempotency_key;
+          const currentKey = (JSON.parse(bodies[1] ?? '{}') as { idempotency_key: string })
+            .idempotency_key;
+          if (currentKey === firstKey) return Response.json(job, { status: 202 });
+          job = {
+            ...running,
+            id: '00000000-0000-4000-8000-000000000002',
+            requested_blocks: 1,
+            completed_blocks: 0,
+          };
+          return Response.json(job, { status: 202 });
+        }
+        return Response.json({ job });
+      });
+
+      const first = renderWithProviders(<MineDialog open onOpenChange={vi.fn()} />);
+      await waitFor(() =>
+        expect(screen.getByRole('button', { name: 'Mine blocks' })).toBeEnabled(),
+      );
+      await userEvent.click(screen.getByRole('button', { name: 'Mine blocks' }));
+      await screen.findByText(/response lost/);
+      first.unmount();
+
+      renderWithProviders(<MineDialog open onOpenChange={vi.fn()} />);
+      await screen.findByText(state === 'completed' ? /Mining completed/ : /Mining failed/);
+      await userEvent.click(screen.getByRole('button', { name: 'Mine blocks' }));
+      await waitFor(() => expect(bodies).toHaveLength(2));
+      await screen.findByText('Mining blocks…');
+      const keys = bodies.map(
+        (body) => (JSON.parse(body) as { idempotency_key: string }).idempotency_key,
+      );
+      expect(keys[1]).not.toBe(keys[0]);
+    },
+  );
 });

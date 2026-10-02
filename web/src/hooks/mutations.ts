@@ -102,7 +102,12 @@ export function useStartMining(): UseMutationResult<MiningJob, Error, number> {
   const queryClient = useQueryClient();
   const operation = operationKey('mine', (blocks: number) => String(blocks));
   return useMutation({
-    mutationFn: (blocks: number) => api.startMining(blocks, operation.keyFor(blocks)),
+    mutationFn: (blocks: number) => {
+      const state = queryClient.getQueryData<{ job: MiningJob | null }>(queryKeys.mining)?.job
+        ?.state;
+      if (state === 'completed' || state === 'failed') operation.clear(blocks);
+      return api.startMining(blocks, operation.keyFor(blocks));
+    },
     retry: false,
     onSuccess: async (job, blocks) => {
       operation.clear(blocks);
