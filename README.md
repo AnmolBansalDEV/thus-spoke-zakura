@@ -267,11 +267,12 @@ docker pull zakuracore/zakura:1.6.0
 docker build -f docker/lightwalletd.Dockerfile -t ths-recovery-lightwalletd:local .
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact broadcast_recovers_after_auto_mine_failure
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact concurrent_identical_sends_have_one_chain_effect
+cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact same_account_cross_pool_round_trip_is_replay_safe
 ```
 
 The first command compiles the integration target. The second runs its
 Docker-free helper coverage and leaves the ignored live regression unexecuted.
-The last two commands explicitly select the live regressions; Cargo supplies that
+The last three commands explicitly select the live regressions; Cargo supplies that
 target with the matching source-built `ths-server` binary, including when
 `CARGO_TARGET_DIR` is set. Do not substitute an installed or older binary.
 
@@ -284,6 +285,14 @@ node, then waits for the production background wallet-sync loop to update the
 existing activity row. Direct mining is intentional: retrying Send or using the
 server's mine endpoint would repair the row through a different path and would
 not prove background recovery.
+
+The same-account round-trip regression unshields 1,000,000 zatoshis from Account 1
+to its transparent pool, then shields 500,000 zatoshis back to Ironwood. It checks
+exact pool balances, Ironwood change, consumption of the received transparent
+output, transaction inclusion, and persisted activity. Replaying each request
+with the same idempotency key must leave balances, activity, and the chain tip
+unchanged. The exact fee and change expectations belong to this controlled
+single-note/single-UTXO fixture and pinned SDK.
 
 This is an integration test, not a mocked proof: image pull/build, wallet
 startup, and Ironwood proving make it materially slower and more resource-
