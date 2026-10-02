@@ -272,7 +272,7 @@ fn dashboard_router(static_dir: PathBuf) -> Router {
 }
 
 pub fn router(state: AppState) -> Router {
-    let static_dir = std::env::var("TSZ_WEB_DIR")
+    let static_dir = std::env::var("THS_WEB_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("web/dist"));
     Router::new()
@@ -351,11 +351,11 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<
         network: "Regtest",
         endpoints: PublicEndpoints {
             dashboard: format!("http://{dashboard_host}"),
-            zakura_rpc: std::env::var("TSZ_PUBLIC_ZAKURA_RPC")
+            zakura_rpc: std::env::var("THS_PUBLIC_ZAKURA_RPC")
                 .unwrap_or_else(|_| "http://127.0.0.1:18232".into()),
-            lightwalletd: std::env::var("TSZ_PUBLIC_LIGHTWALLETD")
+            lightwalletd: std::env::var("THS_PUBLIC_LIGHTWALLETD")
                 .unwrap_or_else(|_| "http://127.0.0.1:9067".into()),
-            p2p: std::env::var("TSZ_PUBLIC_P2P").unwrap_or_else(|_| "127.0.0.1:18233".into()),
+            p2p: std::env::var("THS_PUBLIC_P2P").unwrap_or_else(|_| "127.0.0.1:18233".into()),
         },
         wallet_sync: state.wallet_sync_status().await,
     }))
@@ -1701,7 +1701,7 @@ mod tests {
         assert_eq!(body, "console.log(1)");
     }
 
-    /// A misconfigured TSZ_WEB_DIR should fail visibly rather than serving an
+    /// A misconfigured THS_WEB_DIR should fail visibly rather than serving an
     /// empty 200 that looks like a working dashboard.
     #[tokio::test]
     async fn a_missing_shell_is_reported_rather_than_served_empty() {
