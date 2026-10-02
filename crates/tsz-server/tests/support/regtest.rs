@@ -281,7 +281,7 @@ struct WalletSyncResponse {
 #[derive(Debug, Deserialize)]
 struct AccountBalance {
     id: u8,
-    orchard_zatoshi: u64,
+    ironwood_zatoshi: u64,
 }
 
 /// Owns an isolated Zakura node, lightwalletd, proxy and `tsz-server` process.
@@ -449,7 +449,7 @@ impl RegtestStack {
                 "GID=0".into(),
                 "--publish".into(),
                 "127.0.0.1::18232".into(),
-                "zakuracore/zakura:1.4.0".into(),
+                "zakuracore/zakura:1.6.0".into(),
                 "zakurad".into(),
                 "start".into(),
             ],
@@ -805,7 +805,7 @@ impl RegtestStack {
                     );
                     let funded = accounts
                         .iter()
-                        .any(|account| account.id == 1 && account.orchard_zatoshi == 500_000_000);
+                        .any(|account| account.id == 1 && account.ironwood_zatoshi == 500_000_000);
                     if health.wallet_sync.state == "ready" && funded {
                         return Ok(());
                     }
@@ -998,6 +998,7 @@ pub enum RecoveryPhase {
     AutoMine,
     DirectMine,
     Recovery,
+    Faucet,
     Cleanup,
 }
 
@@ -1009,6 +1010,7 @@ impl RecoveryPhase {
             Self::AutoMine => "auto-mine",
             Self::DirectMine => "direct-mine",
             Self::Recovery => "recovery",
+            Self::Faucet => "faucet",
             Self::Cleanup => "cleanup",
         }
     }
@@ -1411,11 +1413,13 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::{Value, json};
 
+    #[cfg(target_os = "linux")]
+    use super::synchronous_command_output_with_timeout;
     use super::{
         CleanupResource, CommandExecutor, CommandOutput, DockerInspect, DockerResource,
         FailureRoute, RecoveryFailureReporter, RegtestStack, docker_resource_exists_from_inspect,
         published_loopback_port, remaining_timeout, shutdown_after_test_cancellation,
-        synchronous_command_output, synchronous_command_output_with_timeout,
+        synchronous_command_output,
     };
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1516,7 +1520,7 @@ mod tests {
             if args.first().is_some_and(|argument| argument == "run")
                 && args
                     .iter()
-                    .any(|argument| argument == "zakuracore/zakura:1.4.0")
+                    .any(|argument| argument == "zakuracore/zakura:1.6.0")
                 && self.fail_node_run.load(Ordering::SeqCst)
             {
                 return Ok(CommandOutput {

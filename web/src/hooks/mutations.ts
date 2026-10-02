@@ -4,7 +4,7 @@ import { queryKeys } from './queries';
 
 /** Everything a successful money movement invalidates. */
 function walletKeys() {
-  return [[...queryKeys.accounts], ['activity'], [...queryKeys.status], ['blocks']];
+  return [[...queryKeys.accounts], ['activity'], [...queryKeys.status], ['blocks'], ['send-quote']];
 }
 
 function useInvalidateWallet() {
@@ -18,20 +18,52 @@ function useInvalidateWallet() {
   };
 }
 
+function operationKey<T>(kind: string, fingerprint: (variables: T) => string) {
+  const storageKey = (variables: T) => `tsz:${kind}:${fingerprint(variables)}`;
+  return {
+    keyFor(variables: T) {
+      const storage = storageKey(variables);
+      let key = sessionStorage.getItem(storage);
+      if (!key) {
+        key = idempotencyKey();
+        sessionStorage.setItem(storage, key);
+      }
+      return key;
+    },
+    clear(variables: T) {
+      sessionStorage.removeItem(storageKey(variables));
+    },
+  };
+}
+
 export interface SendVariables {
   from_account: number;
   to_account: number;
   source_pool: Pool;
   destination_pool: Pool;
   amount_zatoshi: bigint;
+  memo?: string;
 }
 
 export function useSend(): UseMutationResult<Activity, Error, SendVariables> {
   const invalidate = useInvalidateWallet();
+  const operation = operationKey('send', (variables: SendVariables) =>
+    JSON.stringify([
+      variables.from_account,
+      variables.to_account,
+      variables.source_pool,
+      variables.destination_pool,
+      variables.amount_zatoshi.toString(),
+      variables.memo ?? null,
+    ]),
+  );
   return useMutation({
     mutationFn: (variables: SendVariables) =>
-      api.send({ ...variables, idempotency_key: idempotencyKey() }),
-    onSuccess: invalidate,
+      api.send({ ...variables, idempotency_key: operation.keyFor(variables) }),
+    onSuccess: async (_activity, variables) => {
+      operation.clear(variables);
+      await invalidate();
+    },
   });
 }
 
@@ -43,10 +75,18 @@ export interface FaucetVariables {
 
 export function useFaucet(): UseMutationResult<Activity, Error, FaucetVariables> {
   const invalidate = useInvalidateWallet();
+  const operation = operationKey(
+    'faucet',
+    (variables: FaucetVariables) =>
+      `${variables.account_id}:${variables.pool}:${variables.amount_zatoshi}`,
+  );
   return useMutation({
     mutationFn: (variables: FaucetVariables) =>
-      api.faucet({ ...variables, idempotency_key: idempotencyKey() }),
-    onSuccess: invalidate,
+      api.faucet({ ...variables, idempotency_key: operation.keyFor(variables) }),
+    onSuccess: async (_activity, variables) => {
+      operation.clear(variables);
+      await invalidate();
+    },
   });
 }
 

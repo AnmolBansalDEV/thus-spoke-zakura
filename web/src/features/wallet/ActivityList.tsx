@@ -26,7 +26,7 @@ function PoolLabel({ pool }: { pool: Activity['source_pool'] }) {
     <span
       className={cn(
         'text-[11px] font-bold tracking-[0.04em] uppercase',
-        pool === 'orchard' ? 'text-accent' : 'text-ink-muted',
+        pool === 'ironwood' ? 'text-accent' : 'text-ink-muted',
       )}
     >
       {pool}

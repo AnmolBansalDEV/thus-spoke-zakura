@@ -17,7 +17,7 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 const APP_IMAGE_REPOSITORY: &str = "ghcr.io/zcashlabs/thus-spoke-zakura-app";
-const ZAKURA_IMAGE: &str = "zakuracore/zakura:1.4.0";
+const ZAKURA_IMAGE: &str = "zakuracore/zakura:1.6.0";
 const LIGHTWALLETD_IMAGE_REPOSITORY: &str = "ghcr.io/zcashlabs/thus-spoke-zakura-lightwalletd";
 
 fn app_image() -> String {
@@ -56,12 +56,20 @@ impl FromStr for InstanceName {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+fn default_regtest() -> String {
+    "regtest".to_owned()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Endpoints {
     pub dashboard: String,
     pub rpc: String,
     pub lightwalletd: String,
     pub p2p: String,
+    #[serde(default = "default_regtest")]
+    pub network: String,
+    #[serde(default)]
+    pub tls: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +91,20 @@ struct FaucetResult {
     amount_zatoshi: u64,
     txid: String,
     block_hash: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct Activity {
+    id: String,
+    kind: String,
+    from_account: Option<u8>,
+    to_account: u8,
+    source_pool: String,
+    destination_pool: String,
+    amount_zatoshi: u64,
+    txid: String,
+    block_hash: Option<String>,
+    status: String,
 }
 
 pub struct Runtime {
@@ -133,18 +155,26 @@ impl Runtime {
         Ok(())
     }
 
-    pub fn start(&self, name: &InstanceName, no_open: bool, json: bool) -> Result<()> {
+    pub fn start(
+        &self,
+        name: &InstanceName,
+        no_open: bool,
+        json: bool,
+        port_offset: u16,
+    ) -> Result<()> {
         self.doctor(false)?;
         for image in [app_image(), lightwalletd_image(), ZAKURA_IMAGE.to_owned()] {
             require_image(&image)?;
         }
         let shutdown = Shutdown::install()?;
-        self.start_with(name, no_open, json, &DockerHost, &shutdown)
+        self.start_with(name, no_open, json, port_offset, &DockerHost, &shutdown)
     }
 
     pub fn status(&self, name: &InstanceName, json: bool) -> Result<()> {
-        let endpoints = inspect_endpoints(&prefix(name))
-            .or_else(|_| self.read_instance(name).map(|i| i.endpoints))?;
+        let endpoints = self
+            .read_instance(name)
+            .map(|i| i.endpoints)
+            .or_else(|_| inspect_endpoints(&prefix(name)))?;
         let running = container_running(&format!("{}-app", prefix(name))).unwrap_or(false);
         if json {
             println!(
@@ -154,8 +184,7 @@ impl Runtime {
                 )?
             );
         } else {
-            println!("{}: {}", name, if running { "running" } else { "stopped" });
-            print_endpoints(name, &endpoints);
+            println!("{}", status_text(name, running, &endpoints));
         }
         Ok(())
     }
@@ -165,7 +194,7 @@ impl Runtime {
         if json {
             println!("{}", serde_json::to_string_pretty(&endpoints)?);
         } else {
-            print_endpoints(name, &endpoints);
+            println!("{}", endpoint_lines(&endpoints));
         }
         Ok(())
     }
@@ -246,6 +275,132 @@ impl Runtime {
             );
             println!("Transaction: {}", result.txid);
             println!("Confirmed in: {}", result.block_hash);
+        }
+        Ok(())
+    }
+
+    pub fn wallet_faucet(
+        &self,
+        name: &InstanceName,
+        accounts: &[u8],
+        amount_zatoshi: u64,
+        pool: &str,
+        json: bool,
+    ) -> Result<()> {
+        let app_container = format!("{}-app", prefix(name));
+        if !container_running(&app_container).unwrap_or(false) {
+            bail!("environment {name} is not running; start it with `ths --name {name}`");
+        }
+        let dashboard = self.read_instance(name)?.endpoints.dashboard;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .build()?;
+        let mut funded = Vec::new();
+        let mut failures = Vec::new();
+        for &account_id in accounts {
+            let idempotency_key =
+                format!("ths-wallet-faucet-{account_id}-{}", uuid::Uuid::new_v4());
+            let outcome = client
+                .post(format!("{dashboard}/api/v1/faucet"))
+                .json(&serde_json::json!({
+                    "account_id": account_id,
+                    "pool": pool,
+                    "amount_zatoshi": amount_zatoshi,
+                    "idempotency_key": idempotency_key,
+                }))
+                .send()
+                .with_context(|| format!("asking environment {name} to fund account {account_id}"));
+            match outcome.and_then(decode_activity) {
+                Ok(activity) => funded.push(activity),
+                Err(error) => failures.push(format!("account {account_id}: {error:#}")),
+            }
+        }
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &serde_json::json!({"funded": funded, "failed": failures})
+                )?
+            );
+        } else {
+            for activity in &funded {
+                println!(
+                    "Funded account {} with {} ZEC ({} pool) on {name}.",
+                    activity.to_account,
+                    format_zec(activity.amount_zatoshi),
+                    activity.destination_pool
+                );
+                println!("  Transaction: {}", activity.txid);
+            }
+            for failure in &failures {
+                eprintln!("Failed to fund {failure}");
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            bail!(
+                "{} of {} faucet requests failed",
+                failures.len(),
+                accounts.len()
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn wallet_send(
+        &self,
+        name: &InstanceName,
+        from: u8,
+        to: u8,
+        source_pool: &str,
+        destination_pool: &str,
+        amount_zatoshi: u64,
+        memo: Option<&str>,
+        json: bool,
+    ) -> Result<()> {
+        let app_container = format!("{}-app", prefix(name));
+        if !container_running(&app_container).unwrap_or(false) {
+            bail!("environment {name} is not running; start it with `ths --name {name}`");
+        }
+        let dashboard = self.read_instance(name)?.endpoints.dashboard;
+        let idempotency_key = format!("ths-wallet-send-{}", uuid::Uuid::new_v4());
+        let response = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .build()?
+            .post(format!("{dashboard}/api/v1/send"))
+            .json(&serde_json::json!({
+                "from_account": from,
+                "to_account": to,
+                "source_pool": source_pool,
+                "destination_pool": destination_pool,
+                "amount_zatoshi": amount_zatoshi,
+                "idempotency_key": idempotency_key,
+                "memo": memo,
+            }))
+            .send()
+            .with_context(|| {
+                format!("asking environment {name} to send from account {from} to account {to}")
+            })?;
+        let activity = decode_activity(response)?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&activity)?);
+        } else {
+            println!(
+                "Sent {} ZEC from account {} ({} pool) to account {} ({} pool) on {name}.",
+                format_zec(activity.amount_zatoshi),
+                from,
+                activity.source_pool,
+                activity.to_account,
+                activity.destination_pool
+            );
+            if let Some(memo) = memo {
+                println!("Memo: {memo}");
+            }
+            println!("Transaction: {}", activity.txid);
+            if let Some(block_hash) = &activity.block_hash {
+                println!("Confirmed in: {block_hash}");
+            }
         }
         Ok(())
     }
@@ -366,6 +521,17 @@ impl Runtime {
     }
 }
 
+fn decode_activity(response: reqwest::blocking::Response) -> Result<Activity> {
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response
+            .text()
+            .unwrap_or_else(|_| "response body was unreadable".to_owned());
+        bail!("rejected ({status}): {detail}");
+    }
+    response.json().context("decoding response")
+}
+
 fn format_zec(zatoshi: u64) -> String {
     let whole = zatoshi / 100_000_000;
     let fraction = zatoshi % 100_000_000;
@@ -375,6 +541,40 @@ fn format_zec(zatoshi: u64) -> String {
         format!("{whole}.{fraction:08}")
             .trim_end_matches('0')
             .to_owned()
+    }
+}
+
+#[derive(Debug)]
+struct HostPorts {
+    dashboard: u16,
+    rpc: u16,
+    p2p: u16,
+    lightwalletd: u16,
+}
+
+fn host_ports(offset: u16) -> Result<HostPorts> {
+    if !offset.is_multiple_of(10) {
+        bail!("--port-offset must be a multiple of 10 (got {offset})");
+    }
+    Ok(HostPorts {
+        dashboard: 32805 + offset,
+        rpc: 18232 + offset,
+        p2p: 18233 + offset,
+        lightwalletd: 9067 + offset,
+    })
+}
+
+fn loopback_publish(host: u16, container: u16) -> String {
+    format!("127.0.0.1:{host}:{container}")
+}
+
+fn require_free_loopback(port: u16) -> Result<()> {
+    match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(())
+        }
+        Err(_) => bail!("port {port} is already in use on 127.0.0.1"),
     }
 }
 
@@ -397,9 +597,11 @@ fn ensure_volume(volume: &str, name: &InstanceName) -> Result<()> {
     }
     Ok(())
 }
-fn ensure_zakura(prefix: &str, name: &InstanceName) -> Result<()> {
+fn ensure_zakura(prefix: &str, name: &InstanceName, ports: &HostPorts) -> Result<()> {
     let target = format!("{prefix}-zakura");
     if !container_exists(&target)? {
+        let rpc_bind = loopback_publish(ports.rpc, 18232);
+        let p2p_bind = loopback_publish(ports.p2p, 18233);
         docker([
             "create",
             "--name",
@@ -411,9 +613,9 @@ fn ensure_zakura(prefix: &str, name: &InstanceName) -> Result<()> {
             "--label",
             &label(name),
             "-p",
-            "127.0.0.1::18232",
+            &rpc_bind,
             "-p",
-            "127.0.0.1::18233",
+            &p2p_bind,
             "-v",
             &format!("{prefix}-chain:/data"),
             "-v",
@@ -427,10 +629,11 @@ fn ensure_zakura(prefix: &str, name: &InstanceName) -> Result<()> {
     }
     Ok(())
 }
-fn ensure_lightwalletd(prefix: &str, name: &InstanceName) -> Result<()> {
+fn ensure_lightwalletd(prefix: &str, name: &InstanceName, ports: &HostPorts) -> Result<()> {
     let target = format!("{prefix}-lightwalletd");
     if !container_exists(&target)? {
         let image = lightwalletd_image();
+        let lightwalletd_bind = loopback_publish(ports.lightwalletd, 9067);
         docker([
             "create",
             "--name",
@@ -444,7 +647,7 @@ fn ensure_lightwalletd(prefix: &str, name: &InstanceName) -> Result<()> {
             "--user",
             "0:0",
             "-p",
-            "127.0.0.1::9067",
+            &lightwalletd_bind,
             "-v",
             &format!("{prefix}-lightwalletd:/var/lib/lightwalletd"),
             &image,
@@ -467,21 +670,13 @@ fn ensure_lightwalletd(prefix: &str, name: &InstanceName) -> Result<()> {
     }
     Ok(())
 }
-fn ensure_app(prefix: &str, name: &InstanceName) -> Result<()> {
+fn ensure_app(prefix: &str, name: &InstanceName, ports: &HostPorts) -> Result<()> {
     let target = format!("{prefix}-app");
     if !container_exists(&target)? {
-        let public_rpc = format!(
-            "http://127.0.0.1:{}",
-            published_port(&format!("{prefix}-zakura"), "18232/tcp")?
-        );
-        let public_lightwalletd = format!(
-            "http://127.0.0.1:{}",
-            published_port(&format!("{prefix}-lightwalletd"), "9067/tcp")?
-        );
-        let public_p2p = format!(
-            "127.0.0.1:{}",
-            published_port(&format!("{prefix}-zakura"), "18233/tcp")?
-        );
+        let public_rpc = format!("http://127.0.0.1:{}", ports.rpc);
+        let public_lightwalletd = format!("http://127.0.0.1:{}", ports.lightwalletd);
+        let public_p2p = format!("127.0.0.1:{}", ports.p2p);
+        let dashboard_bind = loopback_publish(ports.dashboard, 8080);
         let image = app_image();
         docker([
             "create",
@@ -492,7 +687,7 @@ fn ensure_app(prefix: &str, name: &InstanceName) -> Result<()> {
             "--label",
             &label(name),
             "-p",
-            "127.0.0.1::8080",
+            &dashboard_bind,
             "-e",
             "TSZ_LISTEN=0.0.0.0:8080",
             "-e",
@@ -518,6 +713,17 @@ fn ensure_app(prefix: &str, name: &InstanceName) -> Result<()> {
     Ok(())
 }
 
+fn endpoints_for(ports: &HostPorts) -> Endpoints {
+    Endpoints {
+        dashboard: format!("http://127.0.0.1:{}", ports.dashboard),
+        rpc: format!("http://127.0.0.1:{}", ports.rpc),
+        lightwalletd: format!("http://127.0.0.1:{}", ports.lightwalletd),
+        p2p: format!("127.0.0.1:{}", ports.p2p),
+        network: default_regtest(),
+        tls: false,
+    }
+}
+
 fn inspect_endpoints(prefix: &str) -> Result<Endpoints> {
     Ok(Endpoints {
         dashboard: format!(
@@ -536,6 +742,8 @@ fn inspect_endpoints(prefix: &str) -> Result<Endpoints> {
             "127.0.0.1:{}",
             published_port(&format!("{prefix}-zakura"), "18233/tcp")?
         ),
+        network: default_regtest(),
+        tls: false,
     })
 }
 fn published_port(container: &str, port: &str) -> Result<u16> {
@@ -689,6 +897,7 @@ trait StartHost {
         runtime: &Runtime,
         name: &InstanceName,
         shutdown: &Shutdown,
+        port_offset: u16,
     ) -> Result<Endpoints>;
     fn wait_ready(
         &self,
@@ -713,9 +922,15 @@ impl StartHost for DockerHost {
         runtime: &Runtime,
         name: &InstanceName,
         shutdown: &Shutdown,
+        port_offset: u16,
     ) -> Result<Endpoints> {
         fs::create_dir_all(runtime.instance_dir(name))?;
         let prefix = prefix(name);
+        let ports = host_ports(port_offset)?;
+        require_free_loopback(ports.dashboard)?;
+        require_free_loopback(ports.rpc)?;
+        require_free_loopback(ports.p2p)?;
+        require_free_loopback(ports.lightwalletd)?;
         ensure_network(&prefix)?;
         shutdown.check()?;
         for suffix in ["chain", "wallet", "lightwalletd", "config"] {
@@ -746,9 +961,9 @@ impl StartHost for DockerHost {
             shutdown.check()?;
         }
 
-        ensure_zakura(&prefix, name)?;
+        ensure_zakura(&prefix, name, &ports)?;
         shutdown.check()?;
-        ensure_lightwalletd(&prefix, name)?;
+        ensure_lightwalletd(&prefix, name, &ports)?;
         shutdown.check()?;
         let zakura_container = format!("{prefix}-zakura");
         docker(["start", &zakura_container])?;
@@ -765,11 +980,11 @@ impl StartHost for DockerHost {
         )?;
         docker(["start", &format!("{prefix}-lightwalletd")])?;
         shutdown.check()?;
-        ensure_app(&prefix, name)?;
+        ensure_app(&prefix, name, &ports)?;
         shutdown.check()?;
         docker(["start", &format!("{prefix}-app")])?;
         shutdown.check()?;
-        let endpoints = inspect_endpoints(&prefix)?;
+        let endpoints = endpoints_for(&ports);
         runtime.write_instance(name, &endpoints)?;
         Ok(endpoints)
     }
@@ -817,6 +1032,7 @@ impl Runtime {
         name: &InstanceName,
         no_open: bool,
         json: bool,
+        port_offset: u16,
         host: &dyn StartHost,
         shutdown: &Shutdown,
     ) -> Result<()> {
@@ -829,7 +1045,7 @@ impl Runtime {
         println!("Preparing a fresh {name} environment…");
         host.delete(self, name)?;
         println!("Starting {name}…");
-        let endpoints = host.allocate(self, name, shutdown)?;
+        let endpoints = host.allocate(self, name, shutdown, port_offset)?;
         shutdown.check()?;
         host.wait_ready(
             &endpoints,
@@ -840,7 +1056,7 @@ impl Runtime {
         if json {
             println!("{}", serde_json::to_string_pretty(&endpoints)?);
         } else {
-            print_endpoints(name, &endpoints);
+            println!("\n{name} is ready 🌸\n{}", endpoint_lines(&endpoints));
         }
         if !no_open {
             host.open_url(&endpoints.dashboard)?;
@@ -949,11 +1165,15 @@ fn wait_for_zakura_tip(
         timeout.as_secs()
     )
 }
-fn print_endpoints(name: &InstanceName, e: &Endpoints) {
-    println!(
-        "\n{name} is ready 🌸\n  Dashboard    {}\n  Zakura RPC   {}\n  lightwalletd {}\n  P2P          {}",
-        e.dashboard, e.rpc, e.lightwalletd, e.p2p
-    );
+fn status_text(name: &InstanceName, running: bool, e: &Endpoints) -> String {
+    let state = if running { "running" } else { "stopped" };
+    format!("{name}: {state}\n{}", endpoint_lines(e))
+}
+fn endpoint_lines(e: &Endpoints) -> String {
+    format!(
+        "  Dashboard    {}\n  Zakura RPC   {}\n  lightwalletd {}  (network={}, tls={})\n  P2P          {}",
+        e.dashboard, e.rpc, e.lightwalletd, e.network, e.tls, e.p2p
+    )
 }
 fn open_url(url: &str) -> Result<()> {
     let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
@@ -1055,6 +1275,7 @@ mod tests {
             _runtime: &Runtime,
             name: &InstanceName,
             shutdown: &Shutdown,
+            _port_offset: u16,
         ) -> Result<Endpoints> {
             self.push(&format!("allocate:{name}"));
             shutdown.check()?;
@@ -1063,6 +1284,8 @@ mod tests {
                 rpc: "http://127.0.0.1:2".into(),
                 lightwalletd: "http://127.0.0.1:3".into(),
                 p2p: "127.0.0.1:4".into(),
+                network: default_regtest(),
+                tls: false,
             })
         }
 
@@ -1115,7 +1338,7 @@ mod tests {
         let (_sender, receiver) = std::sync::mpsc::channel();
         let shutdown = Shutdown::from_receiver(receiver);
         let err = runtime_for_tests()
-            .start_with(&name("alpha"), false, false, &host, &shutdown)
+            .start_with(&name("alpha"), false, false, 0, &host, &shutdown)
             .unwrap_err();
         assert!(err.to_string().contains("dashboard did not become healthy"));
         let events = events.lock().unwrap().clone();
@@ -1144,7 +1367,7 @@ mod tests {
         let (_sender, receiver) = std::sync::mpsc::channel();
         let shutdown = Shutdown::from_receiver(receiver);
         let err = runtime_for_tests()
-            .start_with(&name("alpha"), false, false, &host, &shutdown)
+            .start_with(&name("alpha"), false, false, 0, &host, &shutdown)
             .unwrap_err();
         assert!(err.to_string().contains("opening"));
         let events = events.lock().unwrap().clone();
@@ -1163,7 +1386,7 @@ mod tests {
         });
         let shutdown = Shutdown::from_receiver(receiver);
         runtime_for_tests()
-            .start_with(&name("alpha"), true, false, &host, &shutdown)
+            .start_with(&name("alpha"), true, false, 0, &host, &shutdown)
             .unwrap();
         let events = events.lock().unwrap().clone();
         assert!(!events.iter().any(|e| e.starts_with("open_url:")));
@@ -1178,7 +1401,7 @@ mod tests {
         let (_sender, receiver) = std::sync::mpsc::channel();
         let shutdown = Shutdown::from_receiver(receiver);
         let err = runtime_for_tests()
-            .start_with(&name("alpha"), false, false, &host, &shutdown)
+            .start_with(&name("alpha"), false, false, 0, &host, &shutdown)
             .unwrap_err();
         assert!(err.to_string().contains("interrupted"));
         let events = events.lock().unwrap().clone();
@@ -1194,7 +1417,7 @@ mod tests {
         sender.send(()).unwrap();
         let shutdown = Shutdown::from_receiver(receiver);
         let err = runtime_for_tests()
-            .start_with(&name("alpha"), false, false, &host, &shutdown)
+            .start_with(&name("alpha"), false, false, 0, &host, &shutdown)
             .unwrap_err();
         assert!(err.to_string().contains("interrupted"));
         let events = events.lock().unwrap().clone();
@@ -1310,5 +1533,68 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("interrupted"));
+    }
+
+    #[test]
+    fn default_offset_uses_stable_loopback_ports() {
+        let ports = host_ports(0).unwrap();
+        assert_eq!(ports.dashboard, 32805);
+        assert_eq!(ports.rpc, 18232);
+        assert_eq!(ports.p2p, 18233);
+        assert_eq!(ports.lightwalletd, 9067);
+        assert_eq!(loopback_publish(ports.rpc, 18232), "127.0.0.1:18232:18232");
+        assert_eq!(
+            loopback_publish(ports.dashboard, 8080),
+            "127.0.0.1:32805:8080"
+        );
+    }
+
+    #[test]
+    fn port_offset_shifts_all_four_hosts_by_the_same_stride() {
+        let base = host_ports(0).unwrap();
+        let shifted = host_ports(10).unwrap();
+        assert_eq!(shifted.dashboard, base.dashboard + 10);
+        assert_eq!(shifted.rpc, base.rpc + 10);
+        assert_eq!(shifted.p2p, base.p2p + 10);
+        assert_eq!(shifted.lightwalletd, base.lightwalletd + 10);
+    }
+
+    #[test]
+    fn port_offset_rejects_values_that_are_not_multiples_of_ten() {
+        let err = host_ports(1).unwrap_err();
+        assert!(err.to_string().contains('1'));
+    }
+
+    #[test]
+    fn reports_the_conflicting_loopback_port() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let err = require_free_loopback(port).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains(&port.to_string()),
+            "error should name port {port}, got {message}"
+        );
+    }
+
+    #[test]
+    fn endpoints_json_includes_regtest_and_plaintext_lightwalletd() {
+        let json = serde_json::to_value(endpoints_for(&host_ports(0).unwrap())).unwrap();
+        assert_eq!(json["dashboard"], "http://127.0.0.1:32805");
+        assert_eq!(json["rpc"], "http://127.0.0.1:18232");
+        assert_eq!(json["lightwalletd"], "http://127.0.0.1:9067");
+        assert_eq!(json["p2p"], "127.0.0.1:18233");
+        assert_eq!(json["network"], "regtest");
+        assert_eq!(json["tls"], false);
+    }
+
+    #[test]
+    fn endpoints_json_without_network_fields_still_deserializes() {
+        let parsed: Endpoints = serde_json::from_str(
+            r#"{"dashboard":"http://127.0.0.1:1","rpc":"http://127.0.0.1:2","lightwalletd":"http://127.0.0.1:3","p2p":"127.0.0.1:4"}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.network, "regtest");
+        assert!(!parsed.tls);
     }
 }

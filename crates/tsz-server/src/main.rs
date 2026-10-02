@@ -1,5 +1,6 @@
 mod api;
 mod db;
+mod reconcile;
 mod rpc;
 mod wallet;
 
@@ -67,10 +68,16 @@ fn init(data_dir: PathBuf, config_dir: PathBuf) -> Result<()> {
     Ok(())
 }
 
+const DEVELOPMENT_CREDENTIAL_WARNING: &str = concat!(
+    "WARNING: Never use this mnemonic or private key in production. ",
+    "It is intended purely for development. Using it in production will result in loss of funds."
+);
+
 fn development_credentials(store: &Store) -> Result<String> {
     let secrets = store.development_secrets()?;
     let mut output =
         String::from("\n⚠ DISPOSABLE REGTEST SECRETS — NEVER SEND REAL FUNDS TO THESE KEYS\n");
+    writeln!(output, "{DEVELOPMENT_CREDENTIAL_WARNING}")?;
     writeln!(output, "Mnemonic: {}", secrets.mnemonic)?;
     for account in secrets.accounts {
         writeln!(
@@ -87,13 +94,27 @@ fn development_credentials(store: &Store) -> Result<String> {
     Ok(output.trim_end().to_owned())
 }
 
+/// A zero-value payment to the P2SH address of an all-zero script hash. Every
+/// chain that activates NU6.1 must carry the one-time ZIP-271 lockbox
+/// disbursement in its activation-block coinbase, and Regtest configures none,
+/// so Zakura rejects that block. This marker satisfies the rule without
+/// creating funds or drawing on the empty local lockbox; Zakura's own local
+/// network generator uses the same marker.
+const LOCKBOX_MARKER_ADDRESS: &str = "t26YoyZ1iPgiMEWL4zGUm74eVWfhyDMXzY2";
+
 fn zakura_config(miner: &str) -> String {
+    // Keep these heights in sync with `wallet::regtest_network()`.
     format!(
         r#"[network]
 network = "Regtest"
 listen_addr = "0.0.0.0:18233"
+[network.testnet_parameters]
+lockbox_disbursements = [{{ address = "{LOCKBOX_MARKER_ADDRESS}", amount = 0 }}]
 [network.testnet_parameters.activation_heights]
 "NU6" = 1
+"NU6.1" = 1
+"NU6.2" = 1
+"NU6.3" = 1
 
 [rpc]
 listen_addr = "0.0.0.0:18232"
@@ -133,7 +154,7 @@ async fn serve(data_dir: PathBuf) -> Result<()> {
     }
     api::provision_initial_balance(&state)
         .await
-        .context("provisioning Account 1 with 5 Orchard ZEC")?;
+        .context("provisioning Account 1 with 5 Ironwood ZEC")?;
     tokio::spawn(api::wallet_sync_loop(state.clone()));
     let app = api::router(state);
     let address: SocketAddr = std::env::var("TSZ_LISTEN")
@@ -165,12 +186,44 @@ mod tests {
     }
 
     #[test]
+    fn activates_ironwood_with_a_lockbox_marker() {
+        let config = zakura_config("tm-miner");
+        for upgrade in ["NU6", "NU6.1", "NU6.2", "NU6.3"] {
+            assert!(config.contains(&format!("\"{upgrade}\" = 1\n")));
+        }
+        assert!(config.contains(&format!(
+            "lockbox_disbursements = [{{ address = \"{LOCKBOX_MARKER_ADDRESS}\", amount = 0 }}]"
+        )));
+        let network = wallet::regtest_network();
+        assert!(matches!(
+            zcash_keys::address::Address::decode(&network, LOCKBOX_MARKER_ADDRESS),
+            Some(zcash_keys::address::Address::Transparent(_))
+        ));
+        assert_eq!(network.nu6_1, network.nu6);
+        assert_eq!(network.nu6_2, network.nu6);
+        assert_eq!(network.nu6_3, network.nu6);
+    }
+
+    #[test]
     fn prints_mnemonic_and_exactly_five_user_account_keys() {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
 
         let output = development_credentials(&store).unwrap();
         let mnemonic = store.development_secrets().unwrap().mnemonic;
+        let warning_at = output
+            .find(DEVELOPMENT_CREDENTIAL_WARNING)
+            .expect("startup credentials must warn against production use");
+        let mnemonic_at = output
+            .find("Mnemonic:")
+            .expect("startup credentials must include the mnemonic");
+        assert!(
+            warning_at < mnemonic_at,
+            "the production-use warning must appear next to the mnemonic and spending keys"
+        );
+        assert!(output.contains("Never use this mnemonic or private key in production"));
+        assert!(output.contains("purely for development"));
+        assert!(output.contains("will result in loss of funds"));
         assert!(output.contains(&format!("Mnemonic: {mnemonic}")));
         assert_eq!(
             hex::encode(mnemonic.parse::<bip39::Mnemonic>().unwrap().to_seed("")),

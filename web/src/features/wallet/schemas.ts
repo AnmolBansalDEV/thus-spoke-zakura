@@ -8,7 +8,7 @@ export const FAUCET_MAX_ZATOSHI = 5n * ZATOSHIS_PER_ZEC;
 export const MINE_MIN_BLOCKS = 1;
 export const MINE_MAX_BLOCKS = 10_000;
 
-const poolField = z.enum(['transparent', 'orchard']);
+const poolField = z.enum(['transparent', 'ironwood']);
 
 /** Selects and inputs hand back strings; the schema owns the conversion. */
 const accountIdField = z
@@ -36,6 +36,22 @@ const amountField = z
     return zatoshi;
   });
 
+/** ZIP-302 memo size; the limit is in UTF-8 bytes, not characters. */
+export const MEMO_MAX_BYTES = 512;
+
+export const memoByteLength = (memo: string) => new TextEncoder().encode(memo).length;
+
+// A disabled textarea can surface as undefined; treat that as "no memo".
+const memoField = z
+  .string()
+  .default('')
+  .refine(
+    (memo) => memoByteLength(memo) <= MEMO_MAX_BYTES,
+    `Memos are limited to ${MEMO_MAX_BYTES} bytes.`,
+  )
+  // Memos are zero-padded, so a trailing NUL would be lost on decode.
+  .refine((memo) => !memo.endsWith('\0'), 'A memo cannot end with a NUL character.');
+
 export const sendSchema = z
   .object({
     from_account: accountIdField,
@@ -43,10 +59,15 @@ export const sendSchema = z
     source_pool: poolField,
     destination_pool: poolField,
     amount: amountField,
+    memo: memoField,
   })
   .refine((values) => values.from_account !== values.to_account, {
     message: 'Pick a different account — sending to yourself only costs the fee.',
     path: ['to_account'],
+  })
+  .refine((values) => values.memo === '' || values.destination_pool === 'ironwood', {
+    message: 'Transparent outputs cannot carry a memo. Choose the ironwood pool.',
+    path: ['memo'],
   });
 export type SendInput = z.input<typeof sendSchema>;
 export type SendValues = z.output<typeof sendSchema>;
