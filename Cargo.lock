@@ -2934,7 +2934,7 @@ dependencies = [
 
 [[package]]
 name = "ths-server"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2980,7 +2980,7 @@ dependencies = [
 
 [[package]]
 name = "thus-spoke-zakura"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
