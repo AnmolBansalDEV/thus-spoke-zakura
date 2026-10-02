@@ -1466,13 +1466,13 @@ fn validate_send(req: &SendRequest) -> ApiResult<Option<MemoBytes>> {
     require_key(&req.idempotency_key)?;
     require_user_account(req.from_account)?;
     require_user_account(req.to_account)?;
-    if req.from_account == req.to_account {
-        return Err(ApiError::bad_request(
-            "from_account and to_account must be different accounts",
-        ));
-    }
     require_pool(&req.source_pool, "source_pool")?;
     require_pool(&req.destination_pool, "destination_pool")?;
+    if req.from_account == req.to_account && req.source_pool == req.destination_pool {
+        return Err(ApiError::bad_request(
+            "choose a different account or a different destination pool",
+        ));
+    }
     if req.amount_zatoshi == 0 || req.amount_zatoshi > MAX_MONEY {
         return Err(ApiError::bad_request(format!(
             "amount_zatoshi must be between 1 and {MAX_MONEY}"
@@ -2128,6 +2128,35 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn send_validation_allows_same_account_only_between_pools() {
+        for to in [1, 2] {
+            for source in ["ironwood", "transparent"] {
+                for destination in ["ironwood", "transparent"] {
+                    let mut body = valid_send();
+                    body["to_account"] = json!(to);
+                    body["source_pool"] = json!(source);
+                    body["destination_pool"] = json!(destination);
+                    let req = serde_json::from_value::<SendRequest>(body).unwrap();
+                    let result = validate_send(&req);
+                    if to == 1 && source == destination {
+                        let error = result.unwrap_err();
+                        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+                        assert_eq!(
+                            error.message,
+                            "choose a different account or a different destination pool"
+                        );
+                    } else {
+                        assert!(
+                            matches!(result, Ok(None)),
+                            "{to}: {source} -> {destination}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn invalid_sends_are_rejected_before_replay_or_synchronization() {
         let (state, _dir) = offline_state();
@@ -2157,7 +2186,34 @@ mod tests {
                 "treasury account",
                 with(&[("to_account", json!(TREASURY_ACCOUNT_ID))]),
             ),
-            ("same account", with(&[("to_account", json!(1))])),
+            ("same account and pool", with(&[("to_account", json!(1))])),
+            (
+                "same account and transparent pool",
+                with(&[
+                    ("to_account", json!(1)),
+                    ("source_pool", json!("transparent")),
+                    ("destination_pool", json!("transparent")),
+                ]),
+            ),
+            (
+                "same account and unsupported source",
+                with(&[("to_account", json!(1)), ("source_pool", json!("sapling"))]),
+            ),
+            (
+                "same account and unsupported destination",
+                with(&[
+                    ("to_account", json!(1)),
+                    ("destination_pool", json!("orchard")),
+                ]),
+            ),
+            (
+                "same account unshield with memo",
+                with(&[
+                    ("to_account", json!(1)),
+                    ("destination_pool", json!("transparent")),
+                    ("memo", json!("hi")),
+                ]),
+            ),
             (
                 "bad source pool",
                 with(&[("source_pool", json!("sapling"))]),
@@ -2197,6 +2253,54 @@ mod tests {
                 .id,
             original.id
         );
+    }
+
+    #[tokio::test]
+    async fn same_account_cross_pool_replays_preserve_activity_and_identity() {
+        for (source, destination) in [("ironwood", "transparent"), ("transparent", "ironwood")] {
+            let (state, _dir) = offline_state();
+            let original = state
+                .0
+                .store
+                .claim_transfer(1, 1, source, destination, 100_000, REPLAY_KEY, None)
+                .unwrap();
+            state
+                .0
+                .store
+                .record_prepared(&original.id, "txid", b"signed transaction", 0)
+                .unwrap();
+            state.0.store.mark_broadcast(&original.id, "txid").unwrap();
+            state
+                .0
+                .store
+                .confirm(&original.id, "txid", &"c".repeat(64))
+                .unwrap();
+            let before = activity_ids(&state);
+            let mut body = valid_send();
+            body["to_account"] = json!(1);
+            body["source_pool"] = json!(source);
+            body["destination_pool"] = json!(destination);
+            for _ in 0..2 {
+                let (status, response) = post_send(&state, &body).await;
+                assert_eq!(status, StatusCode::OK, "{response}");
+                assert_eq!(response["id"], original.id);
+                assert_eq!(response["txid"], "txid");
+                assert_eq!(response["from_account"], 1);
+                assert_eq!(response["to_account"], 1);
+                assert_eq!(response["source_pool"], source);
+                assert_eq!(response["destination_pool"], destination);
+            }
+            for changed in [("amount_zatoshi", json!(100_001)), ("to_account", json!(2))] {
+                let mut conflict = body.clone();
+                conflict[changed.0] = changed.1;
+                assert_eq!(post_send(&state, &conflict).await.0, StatusCode::CONFLICT);
+            }
+            let mut reverse = body.clone();
+            reverse["source_pool"] = json!(destination);
+            reverse["destination_pool"] = json!(source);
+            assert_eq!(post_send(&state, &reverse).await.0, StatusCode::CONFLICT);
+            assert_eq!(activity_ids(&state), before);
+        }
     }
 
     #[tokio::test]
@@ -2520,38 +2624,44 @@ mod tests {
 
     #[tokio::test]
     async fn retry_submits_the_same_prepared_transaction_after_a_lost_response() {
-        let store = Store::open(":memory:").unwrap();
-        store.initialize().unwrap();
-        let claim = store
-            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
-            .unwrap();
-        store
-            .record_prepared(&claim.id, "real-txid", b"signed transaction", 140)
-            .unwrap();
-        let prepared = store.activity_for_key("same").unwrap().unwrap();
-        let runtime = RecordingPaymentSubmitter {
-            lookups: Mutex::new(VecDeque::from([
-                Ok(false),
-                Err("node unavailable"),
-                Ok(false),
-            ])),
-            height: AtomicU64::new(139),
-            fail_next: AtomicBool::new(true),
-            ..Default::default()
-        };
+        for (to, source, destination) in [
+            (2, "ironwood", "ironwood"),
+            (1, "ironwood", "transparent"),
+            (1, "transparent", "ironwood"),
+        ] {
+            let store = Store::open(":memory:").unwrap();
+            store.initialize().unwrap();
+            let claim = store
+                .claim_transfer(1, to, source, destination, 12_000, "same", None)
+                .unwrap();
+            store
+                .record_prepared(&claim.id, "real-txid", b"signed transaction", 140)
+                .unwrap();
+            let prepared = store.activity_for_key("same").unwrap().unwrap();
+            let runtime = RecordingPaymentSubmitter {
+                lookups: Mutex::new(VecDeque::from([
+                    Ok(false),
+                    Err("node unavailable"),
+                    Ok(false),
+                ])),
+                height: AtomicU64::new(139),
+                fail_next: AtomicBool::new(true),
+                ..Default::default()
+            };
 
-        assert!(submit_prepared(&store, &runtime, &prepared).await.is_err());
-        assert_eq!(
-            store.activity_for_key("same").unwrap().unwrap().status,
-            "prepared"
-        );
+            assert!(submit_prepared(&store, &runtime, &prepared).await.is_err());
+            assert_eq!(
+                store.activity_for_key("same").unwrap().unwrap().status,
+                "prepared"
+            );
 
-        let broadcast = submit_prepared(&store, &runtime, &prepared).await.unwrap();
-        assert!(matches!(broadcast, PreparedSubmission::Broadcast(_)));
-        assert_eq!(
-            runtime.broadcasts.into_inner().unwrap(),
-            [b"signed transaction", b"signed transaction"]
-        );
+            let broadcast = submit_prepared(&store, &runtime, &prepared).await.unwrap();
+            assert!(matches!(broadcast, PreparedSubmission::Broadcast(_)));
+            assert_eq!(
+                runtime.broadcasts.into_inner().unwrap(),
+                [b"signed transaction", b"signed transaction"]
+            );
+        }
     }
 
     #[tokio::test]
