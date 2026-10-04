@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 const APP_IMAGE_REPOSITORY: &str = "ghcr.io/zcashlabs/thus-spoke-zakura-app";
 const ZAKURA_IMAGE: &str = "zakuracore/zakura:1.6.0";
 const LIGHTWALLETD_IMAGE_REPOSITORY: &str = "ghcr.io/zcashlabs/thus-spoke-zakura-lightwalletd";
-const INSTANCE_LABEL: &str = "com.zakura.tsz.instance";
+const INSTANCE_LABEL: &str = "com.zakura.ths.instance";
 
 fn app_image() -> String {
     format!("{APP_IMAGE_REPOSITORY}:{}", env!("CARGO_PKG_VERSION"))
@@ -621,7 +621,7 @@ fn require_free_loopback(port: u16) -> Result<()> {
 }
 
 fn prefix(name: &InstanceName) -> String {
-    format!("tsz-{name}")
+    format!("ths-{name}")
 }
 fn label(name: &InstanceName) -> String {
     format!("{INSTANCE_LABEL}={name}")
@@ -822,19 +822,19 @@ fn ensure_app(prefix: &str, name: &InstanceName, ports: &HostPorts) -> Result<()
             "-p",
             &dashboard_bind,
             "-e",
-            "TSZ_LISTEN=0.0.0.0:8080",
+            "THS_LISTEN=0.0.0.0:8080",
             "-e",
-            "TSZ_ZAKURA_RPC=http://zakura:18232",
+            "THS_ZAKURA_RPC=http://zakura:18232",
             "-e",
-            "TSZ_LIGHTWALLETD=http://lightwalletd:9067",
+            "THS_LIGHTWALLETD=http://lightwalletd:9067",
             "-e",
-            &format!("TSZ_INSTANCE={name}"),
+            &format!("THS_INSTANCE={name}"),
             "-e",
-            &format!("TSZ_PUBLIC_ZAKURA_RPC={public_rpc}"),
+            &format!("THS_PUBLIC_ZAKURA_RPC={public_rpc}"),
             "-e",
-            &format!("TSZ_PUBLIC_LIGHTWALLETD={public_lightwalletd}"),
+            &format!("THS_PUBLIC_LIGHTWALLETD={public_lightwalletd}"),
             "-e",
-            &format!("TSZ_PUBLIC_P2P={public_p2p}"),
+            &format!("THS_PUBLIC_P2P={public_p2p}"),
             "-v",
             &format!("{prefix}-wallet:/data"),
             &image,
@@ -1429,16 +1429,16 @@ mod tests {
         let runtime = Runtime {
             root: dir.path().to_path_buf(),
         };
-        let mut docker = RecordingDocker::new("tsz-alpha-app", "tsz-alpha-wallet", "");
+        let mut docker = RecordingDocker::new("ths-alpha-app", "ths-alpha-wallet", "");
         docker.inspect(
             "container",
-            "tsz-alpha-app",
-            r#"[{"Id":"owned-container","Config":{"Labels":{"com.zakura.tsz.instance":"alpha"}}}]"#,
+            "ths-alpha-app",
+            r#"[{"Id":"owned-container","Config":{"Labels":{"com.zakura.ths.instance":"alpha"}}}]"#,
         );
         docker.inspect(
             "volume",
-            "tsz-alpha-wallet",
-            r#"[{"Name":"tsz-alpha-wallet","Labels":{"com.zakura.tsz.instance":"other"}}]"#,
+            "ths-alpha-wallet",
+            r#"[{"Name":"ths-alpha-wallet","Labels":{"com.zakura.ths.instance":"other"}}]"#,
         );
 
         let error = runtime
@@ -1458,21 +1458,21 @@ mod tests {
         let metadata = runtime.instance_dir(&name("alpha"));
         fs::create_dir_all(&metadata).unwrap();
         fs::write(metadata.join("instance.json"), "partial startup").unwrap();
-        let mut docker = RecordingDocker::new("", "tsz-alpha-chain\ntsz-alpha-wallet", "tsz-alpha");
+        let mut docker = RecordingDocker::new("", "ths-alpha-chain\nths-alpha-wallet", "ths-alpha");
         docker.inspect(
             "volume",
-            "tsz-alpha-chain",
-            r#"[{"Name":"tsz-alpha-chain","Labels":{"com.zakura.tsz.instance":"alpha"}}]"#,
+            "ths-alpha-chain",
+            r#"[{"Name":"ths-alpha-chain","Labels":{"com.zakura.ths.instance":"alpha"}}]"#,
         );
         docker.inspect(
             "volume",
-            "tsz-alpha-wallet",
-            r#"[{"Name":"tsz-alpha-wallet","Labels":{"com.zakura.tsz.instance":"other"}}]"#,
+            "ths-alpha-wallet",
+            r#"[{"Name":"ths-alpha-wallet","Labels":{"com.zakura.ths.instance":"other"}}]"#,
         );
         docker.inspect(
             "network",
-            "tsz-alpha",
-            r#"[{"Id":"owned-network","Labels":{"com.zakura.tsz.instance":"alpha"}}]"#,
+            "ths-alpha",
+            r#"[{"Id":"owned-network","Labels":{"com.zakura.ths.instance":"alpha"}}]"#,
         );
 
         let error = runtime
@@ -1482,7 +1482,7 @@ mod tests {
         assert!(format!("{error:#}").contains("not owned"), "{error:#}");
         assert_eq!(
             *docker.runs.lock().unwrap(),
-            ["volume rm tsz-alpha-chain", "network rm owned-network"]
+            ["volume rm ths-alpha-chain", "network rm owned-network"]
         );
         assert_eq!(
             fs::read_to_string(metadata.join("instance.json")).unwrap(),
@@ -1496,11 +1496,11 @@ mod tests {
         let runtime = Runtime {
             root: dir.path().to_path_buf(),
         };
-        let mut docker = RecordingDocker::new("tsz-alpha-app", "", "");
+        let mut docker = RecordingDocker::new("ths-alpha-app", "", "");
         docker.inspect(
             "container",
-            "tsz-alpha-app",
-            r#"[{"Id":"foreign-container","Config":{"Labels":{"com.zakura.tsz.instance":"other"}}}]"#,
+            "ths-alpha-app",
+            r#"[{"Id":"foreign-container","Config":{"Labels":{"com.zakura.ths.instance":"other"}}}]"#,
         );
 
         let error = runtime
@@ -1517,21 +1517,21 @@ mod tests {
         let runtime = Runtime {
             root: dir.path().to_path_buf(),
         };
-        let mut docker = RecordingDocker::new("tsz-alpha-app", "tsz-alpha-wallet", "tsz-alpha");
+        let mut docker = RecordingDocker::new("ths-alpha-app", "ths-alpha-wallet", "ths-alpha");
         docker.inspect(
             "container",
-            "tsz-alpha-app",
-            r#"[{"Id":"owned-container","Config":{"Labels":{"com.zakura.tsz.instance":"alpha"}}}]"#,
+            "ths-alpha-app",
+            r#"[{"Id":"owned-container","Config":{"Labels":{"com.zakura.ths.instance":"alpha"}}}]"#,
         );
         docker.inspect(
             "volume",
-            "tsz-alpha-wallet",
-            r#"[{"Name":"tsz-alpha-wallet","Labels":{"com.zakura.tsz.instance":"alpha"}}]"#,
+            "ths-alpha-wallet",
+            r#"[{"Name":"ths-alpha-wallet","Labels":{"com.zakura.ths.instance":"alpha"}}]"#,
         );
         docker.inspect(
             "network",
-            "tsz-alpha",
-            r#"[{"Id":"owned-network","Labels":{"com.zakura.tsz.instance":"alpha"}}]"#,
+            "ths-alpha",
+            r#"[{"Id":"owned-network","Labels":{"com.zakura.ths.instance":"alpha"}}]"#,
         );
 
         runtime
@@ -1542,7 +1542,7 @@ mod tests {
             *docker.runs.lock().unwrap(),
             [
                 "rm -f owned-container",
-                "volume rm tsz-alpha-wallet",
+                "volume rm ths-alpha-wallet",
                 "network rm owned-network",
             ]
         );
@@ -1557,20 +1557,20 @@ mod tests {
         let metadata = runtime.instance_dir(&name("alpha"));
         fs::create_dir_all(&metadata).unwrap();
         fs::write(metadata.join("instance.json"), "important data").unwrap();
-        let mut docker = RecordingDocker::new("tsz-alpha-app", "tsz-alpha-wallet", "tsz-alpha");
+        let mut docker = RecordingDocker::new("ths-alpha-app", "ths-alpha-wallet", "ths-alpha");
         docker.inspect(
             "container",
-            "tsz-alpha-app",
-            r#"[{"Id":"owned-container","Config":{"Labels":{"com.zakura.tsz.instance":"alpha"}}}]"#,
+            "ths-alpha-app",
+            r#"[{"Id":"owned-container","Config":{"Labels":{"com.zakura.ths.instance":"alpha"}}}]"#,
         );
         docker.inspect(
             "volume",
-            "tsz-alpha-wallet",
-            r#"[{"Name":"tsz-alpha-wallet","Labels":{"com.zakura.tsz.instance":"alpha"}}]"#,
+            "ths-alpha-wallet",
+            r#"[{"Name":"ths-alpha-wallet","Labels":{"com.zakura.ths.instance":"alpha"}}]"#,
         );
         docker.inspect(
             "network",
-            "tsz-alpha",
+            "ths-alpha",
             r#"[{"Id":"old-network","Labels":{}}]"#,
         );
 
@@ -1595,13 +1595,13 @@ mod tests {
                 match args {
                     ["network", "ls", "--format", "{{.Name}}"] => {
                         Ok(if self.0.load(Ordering::SeqCst) {
-                            "tsz-alpha".into()
+                            "ths-alpha".into()
                         } else {
                             String::new()
                         })
                     }
-                    ["network", "inspect", "tsz-alpha"] => Ok(
-                        r#"[{"Id":"owned-network","Labels":{"com.zakura.tsz.instance":"alpha"}}]"#
+                    ["network", "inspect", "ths-alpha"] => Ok(
+                        r#"[{"Id":"owned-network","Labels":{"com.zakura.ths.instance":"alpha"}}]"#
                             .into(),
                     ),
                     _ => bail!("unexpected Docker read: {args:?}"),
@@ -1615,8 +1615,8 @@ mod tests {
                         "network",
                         "create",
                         "--label",
-                        "com.zakura.tsz.instance=alpha",
-                        "tsz-alpha"
+                        "com.zakura.ths.instance=alpha",
+                        "ths-alpha"
                     ]
                 );
                 self.0.store(true, Ordering::SeqCst);
@@ -1626,15 +1626,15 @@ mod tests {
 
         let docker = NewNetwork(AtomicBool::new(false));
 
-        ensure_network_with("tsz-alpha", &name("alpha"), &docker).unwrap();
+        ensure_network_with("ths-alpha", &name("alpha"), &docker).unwrap();
         assert!(docker.0.load(Ordering::SeqCst));
     }
 
     #[test]
     fn duplicate_network_names_are_rejected() {
-        let docker = RecordingDocker::new("", "", "tsz-alpha\ntsz-alpha");
+        let docker = RecordingDocker::new("", "", "ths-alpha\nths-alpha");
 
-        let error = ensure_network_with("tsz-alpha", &name("alpha"), &docker).unwrap_err();
+        let error = ensure_network_with("ths-alpha", &name("alpha"), &docker).unwrap_err();
 
         assert!(
             error.to_string().contains("multiple network resources"),
@@ -1651,12 +1651,12 @@ mod tests {
             fn output(&self, args: &[&str]) -> Result<String> {
                 match args {
                     ["volume", "ls", "--format", "{{.Name}}"] => Ok(if self.0.load(Ordering::SeqCst) {
-                        "tsz-alpha-wallet".into()
+                        "ths-alpha-wallet".into()
                     } else {
                         String::new()
                     }),
-                    ["volume", "inspect", "tsz-alpha-wallet"] => Ok(
-                        r#"[{"Name":"tsz-alpha-wallet","Labels":{"com.zakura.tsz.instance":"other"}}]"#.into(),
+                    ["volume", "inspect", "ths-alpha-wallet"] => Ok(
+                        r#"[{"Name":"ths-alpha-wallet","Labels":{"com.zakura.ths.instance":"other"}}]"#.into(),
                     ),
                     _ => bail!("unexpected Docker read: {args:?}"),
                 }
@@ -1669,8 +1669,8 @@ mod tests {
                         "volume",
                         "create",
                         "--label",
-                        "com.zakura.tsz.instance=alpha",
-                        "tsz-alpha-wallet"
+                        "com.zakura.ths.instance=alpha",
+                        "ths-alpha-wallet"
                     ]
                 );
                 self.0.store(true, Ordering::SeqCst);
@@ -1679,7 +1679,7 @@ mod tests {
         }
 
         let error = ensure_volume_with(
-            "tsz-alpha-wallet",
+            "ths-alpha-wallet",
             &name("alpha"),
             &RacingVolume(AtomicBool::new(false)),
         )
@@ -1778,7 +1778,7 @@ mod tests {
 
     fn runtime_for_tests() -> Runtime {
         Runtime {
-            root: std::env::temp_dir().join("tsz-start-cleanup-tests"),
+            root: std::env::temp_dir().join("ths-start-cleanup-tests"),
         }
     }
 

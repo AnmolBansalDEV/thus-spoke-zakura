@@ -97,6 +97,39 @@ Select **Mine** from any dashboard page and enter the number of blocks. This is
 useful when testing confirmations, expiry, coinbase maturity, or code that
 reacts to new blocks.
 
+Mining runs in the server. You can dismiss the dialog, navigate to another page,
+refresh, or close the tab while it runs. The dashboard restores the latest job
+and its confirmed progress when you return. Only one manual job can run at a
+time, including wallet synchronization. Payment and faucet confirmation mining
+can interleave; those blocks do not count toward the manual request.
+
+Progress counts hashes acknowledged for this job. If a mining RPC fails, extra
+blocks may have committed without a usable response. The dashboard then shows a
+lower-bound count and uncertain progress; the server never automatically retries
+that RPC. A wallet synchronization failure after mining reports the full mined
+count separately from the synchronization error.
+
+The dashboard uses these job endpoints:
+
+| Endpoint | Behavior |
+| --- | --- |
+| `POST /api/v1/mining/jobs` | Accept `{blocks, idempotency_key}` and return the job with HTTP 202 |
+| `GET /api/v1/mining/jobs` | Return `{job}` for the latest job, or `{job: null}` |
+| `GET /api/v1/mining/jobs/{id}` | Return a retained job, or HTTP 404 |
+
+Reusing an accepted key with the same block count returns the same job. A changed
+count for that key or a different request during an active manual job returns
+HTTP 409. The server retains at most 1,024 jobs and their keys for its process
+lifetime. At capacity, it rejects new admissions with HTTP 503 while reads and
+existing-key replays remain available. Stopping the server cancels running work
+and discards the history; jobs are not recovered after restart.
+
+`ths mine` still waits for the server-owned job and wallet synchronization before
+reporting success. Its HTTP client times out after 300 seconds, but an admitted
+job continues after that timeout or a client disconnection. Inspect the latest
+job before issuing another command. Each legacy request uses a fresh internal
+key, so repeating a command after completion starts another job.
+
 ![Mine blocks on the local Regtest network](docs/images/mine.png)
 
 ### Explore blocks and transactions
@@ -173,9 +206,9 @@ Running `ths` with no command starts the default environment.
 | `ths faucet <ADDRESS>` | Send 1 disposable ZEC to a Regtest unified or transparent address |
 | `ths faucet <ADDRESS> --amount 2.5` | Send a custom amount of up to 5 disposable ZEC |
 | `ths wallet faucet --accounts 1,2,3 --amount 3` | Fund development accounts by index from the treasury |
-| `ths wallet send --from 1 --to 2 --amount 1 --memo "hi"` | Send between development accounts, with an optional Ironwood memo |
-| `ths wallet shield --from 1 --to 2 --amount 0.5` | Spend transparent funds into another account's Ironwood balance |
-| `ths wallet unshield --from 1 --to 2 --amount 0.2` | Spend Ironwood funds into another account's transparent balance |
+| `ths wallet send --from 1 --to 2 --amount 1 --memo "hi"` | Send between development accounts or pools, with an optional Ironwood memo |
+| `ths wallet shield --from 1 --to 2 --amount 0.5` | Spend transparent funds into the same or another account's Ironwood balance |
+| `ths wallet unshield --from 1 --to 2 --amount 0.2` | Spend Ironwood funds into the same or another account's transparent balance |
 | `ths logs app -f` | Follow dashboard/server logs |
 | `ths logs zakura -f` | Follow node logs |
 | `ths logs lightwalletd -f` | Follow lightwalletd logs |
@@ -260,22 +293,23 @@ live test remains ignored until explicitly selected. The node and lightwalletd
 remain real external services for that explicit invocation.
 
 ```console
-cargo test --locked --profile dev-runtime -p tsz-server --test activity_recovery --no-run
-cargo test --locked --profile dev-runtime -p tsz-server --test activity_recovery
+cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery --no-run
+cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery
 # The preceding command runs helper tests; the live test remains ignored.
 docker pull zakuracore/zakura:1.6.0
-docker build -f docker/lightwalletd.Dockerfile -t tsz-recovery-lightwalletd:local .
-cargo test --locked --profile dev-runtime -p tsz-server --test activity_recovery -- --ignored --exact broadcast_recovers_after_auto_mine_failure
-cargo test --locked --profile dev-runtime -p tsz-server --test activity_recovery -- --ignored --exact concurrent_identical_sends_have_one_chain_effect
+docker build -f docker/lightwalletd.Dockerfile -t ths-recovery-lightwalletd:local .
+cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact broadcast_recovers_after_auto_mine_failure
+cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact concurrent_identical_sends_have_one_chain_effect
+cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact same_account_cross_pool_round_trip_is_replay_safe
 ```
 
 The first command compiles the integration target. The second runs its
 Docker-free helper coverage and leaves the ignored live regression unexecuted.
-The last two commands explicitly select the live regressions; Cargo supplies that
-target with the matching source-built `tsz-server` binary, including when
+The last three commands explicitly select the live regressions; Cargo supplies that
+target with the matching source-built `ths-server` binary, including when
 `CARGO_TARGET_DIR` is set. Do not substitute an installed or older binary.
 
-The live test owns a UUID-prefixed `tsz-recovery-*` Docker network, containers,
+The live test owns a UUID-prefixed `ths-recovery-*` Docker network, containers,
 and volumes, plus private temporary data/configuration directories, a local RPC
 proxy, and a local server process. It sends a genuine 1,000,000-zatoshi (0.01
 ZEC) Ironwood payment from Account 1 to Account 2, deliberately rejects exactly
@@ -284,6 +318,14 @@ node, then waits for the production background wallet-sync loop to update the
 existing activity row. Direct mining is intentional: retrying Send or using the
 server's mine endpoint would repair the row through a different path and would
 not prove background recovery.
+
+The same-account round-trip regression unshields 1,000,000 zatoshis from Account 1
+to its transparent pool, then shields 500,000 zatoshis back to Ironwood. It checks
+exact pool balances, Ironwood change, consumption of the received transparent
+output, transaction inclusion, and persisted activity. Replaying each request
+with the same idempotency key must leave balances, activity, and the chain tip
+unchanged. The exact fee and change expectations belong to this controlled
+single-note/single-UTXO fixture and pinned SDK.
 
 This is an integration test, not a mocked proof: image pull/build, wallet
 startup, and Ironwood proving make it materially slower and more resource-
@@ -305,7 +347,7 @@ production-code edit.
 ## How it fits together
 
 ```text
-Browser ──HTTP/SSE── tsz-server ──JSON-RPC── Zakura (Regtest)
+Browser ──HTTP/SSE── ths-server ──JSON-RPC── Zakura (Regtest)
                          │                       │
                          └──────gRPC──── lightwalletd
 ```

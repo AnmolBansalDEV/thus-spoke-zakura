@@ -6,6 +6,7 @@ import {
   type AddressInfo,
   type Block,
   type BlockPage,
+  type MiningJob,
   type SendQuote,
   type SendQuoteInput,
   type Status,
@@ -18,6 +19,7 @@ import {
  */
 export const queryKeys = {
   status: ['status'] as const,
+  mining: ['mining'] as const,
   accounts: ['accounts'] as const,
   activity: (limit: number) => ['activity', limit] as const,
   blocks: (before?: number) => ['blocks', before ?? 'tip'] as const,
@@ -76,5 +78,19 @@ export function useAddress(address: string): UseQueryResult<AddressInfo> {
     queryKey: queryKeys.address(address),
     queryFn: () => api.address(address),
     enabled: address.length > 0,
+  });
+}
+
+export function useMiningJob(): UseQueryResult<{ job: MiningJob | null }> {
+  return useQuery({
+    queryKey: queryKeys.mining,
+    queryFn: api.miningJob,
+    staleTime: 0,
+    refetchOnMount: true,
+    refetchOnReconnect: true,
+    refetchInterval: (query) => {
+      const state = query.state.data?.job?.state;
+      return state === 'mining' || state === 'syncing' ? 1_000 : 5_000;
+    },
   });
 }

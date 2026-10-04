@@ -31,7 +31,11 @@ use crate::{
         Account, Activity, IdempotencyConflict, PreparedTransaction, Store, TREASURY_ACCOUNT_ID,
         USER_ACCOUNT_COUNT, ZATOSHIS_PER_ZEC,
     },
-    rpc::{ChainCheckpoint, ChainInfo, NodeRpc},
+    mining::{
+        Admission, MiningAdmissionError, MiningCoordinator, MiningJob, MiningRuntime, MiningState,
+        validate_idempotency_key,
+    },
+    rpc::{ChainCheckpoint, ChainInfo, NodeRpc, RpcError},
     wallet::{
         PaymentError, PreparedPayment, RealWallet, SendQuote, WALLET_BIRTHDAY_HEIGHT,
         regtest_network,
@@ -41,6 +45,9 @@ use crate::{
 #[derive(Clone)]
 pub struct AppState(Arc<Inner>);
 struct Inner {
+    mining: Arc<MiningCoordinator>,
+    #[cfg(test)]
+    mining_runtime: Option<Arc<dyn MiningRuntime>>,
     store: Store,
     wallet: RealWallet,
     rpc: NodeRpc,
@@ -74,6 +81,9 @@ impl AppState {
         let (events, _) = broadcast::channel(128);
         let accounts = store.accounts().unwrap_or_default();
         Self(Arc::new(Inner {
+            mining: Arc::new(MiningCoordinator::new()),
+            #[cfg(test)]
+            mining_runtime: None,
             store,
             wallet,
             rpc: NodeRpc::new(rpc),
@@ -272,7 +282,7 @@ fn dashboard_router(static_dir: PathBuf) -> Router {
 }
 
 pub fn router(state: AppState) -> Router {
-    let static_dir = std::env::var("TSZ_WEB_DIR")
+    let static_dir = std::env::var("THS_WEB_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("web/dist"));
     Router::new()
@@ -285,6 +295,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/faucet", post(faucet))
         .route("/api/v1/faucet/address", post(faucet_address))
         .route("/api/v1/mine", post(mine))
+        .route(
+            "/api/v1/mining/jobs",
+            get(latest_mining_job).post(start_mining_job),
+        )
+        .route("/api/v1/mining/jobs/{id}", get(mining_job))
         .route("/api/v1/dev/seed", post(seed))
         .route("/api/v1/blocks", get(blocks))
         .route("/api/v1/blocks/{id}", get(block))
@@ -351,11 +366,11 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<
         network: "Regtest",
         endpoints: PublicEndpoints {
             dashboard: format!("http://{dashboard_host}"),
-            zakura_rpc: std::env::var("TSZ_PUBLIC_ZAKURA_RPC")
+            zakura_rpc: std::env::var("THS_PUBLIC_ZAKURA_RPC")
                 .unwrap_or_else(|_| "http://127.0.0.1:18232".into()),
-            lightwalletd: std::env::var("TSZ_PUBLIC_LIGHTWALLETD")
+            lightwalletd: std::env::var("THS_PUBLIC_LIGHTWALLETD")
                 .unwrap_or_else(|_| "http://127.0.0.1:9067".into()),
-            p2p: std::env::var("TSZ_PUBLIC_P2P").unwrap_or_else(|_| "127.0.0.1:18233".into()),
+            p2p: std::env::var("THS_PUBLIC_P2P").unwrap_or_else(|_| "127.0.0.1:18233".into()),
         },
         wallet_sync: state.wallet_sync_status().await,
     }))
@@ -1175,6 +1190,81 @@ pub async fn provision_initial_balance(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
+struct ManualMiningAdapter(AppState);
+
+#[async_trait::async_trait]
+impl MiningRuntime for ManualMiningAdapter {
+    async fn generate_one(&self) -> anyhow::Result<String> {
+        let mut hashes = self.0.0.rpc.generate(1).await?;
+        anyhow::ensure!(
+            hashes.len() == 1 && !hashes[0].is_empty(),
+            "Zakura must return exactly one nonempty mined block hash"
+        );
+        Ok(hashes.remove(0))
+    }
+
+    async fn synchronize(&self, tip_hash: &str) -> anyhow::Result<()> {
+        let height = self
+            .0
+            .0
+            .rpc
+            .block(tip_hash)
+            .await?
+            .pointer("/height")
+            .and_then(Value::as_u64)
+            .context("Zakura mined block omitted its height")?;
+        self.0.synchronize_wallet(Some(height)).await
+    }
+
+    fn notify(&self, topic: &'static str) {
+        notify(&self.0, topic);
+    }
+}
+
+impl AppState {
+    async fn start_mining(&self, blocks: u32, key: String) -> ApiResult<Admission> {
+        let runtime: Arc<dyn MiningRuntime> = Arc::new(ManualMiningAdapter(self.clone()));
+        #[cfg(test)]
+        let runtime = self.0.mining_runtime.clone().unwrap_or(runtime);
+        Ok(self.0.mining.start(runtime, blocks, key).await?)
+    }
+}
+
+#[derive(Deserialize)]
+struct StartMiningRequest {
+    blocks: u32,
+    idempotency_key: String,
+}
+
+async fn start_mining_job(
+    State(state): State<AppState>,
+    Json(req): Json<StartMiningRequest>,
+) -> ApiResult<(StatusCode, Json<MiningJob>)> {
+    require_key(&req.idempotency_key)?;
+    let admission = state.start_mining(req.blocks, req.idempotency_key).await?;
+    Ok((StatusCode::ACCEPTED, Json(admission.job)))
+}
+
+async fn latest_mining_job(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({"job":state.0.mining.latest().await}))
+}
+
+async fn mining_job(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<MiningJob>> {
+    state
+        .0
+        .mining
+        .get(&id)
+        .await
+        .map(Json)
+        .ok_or_else(|| ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: "Mining job does not exist".into(),
+        })
+}
+
 #[derive(Deserialize)]
 struct MineRequest {
     blocks: u32,
@@ -1186,8 +1276,35 @@ async fn mine(
     if !(1..=10_000).contains(&req.blocks) {
         return Err(ApiError::bad_request("blocks must be between 1 and 10,000"));
     }
-    let hashes = mine_and_sync(&state, req.blocks).await?;
-    Ok(Json(json!({"blocks":hashes.len(),"hashes":hashes})))
+    let mut admission = state
+        .start_mining(req.blocks, uuid::Uuid::new_v4().to_string())
+        .await?;
+    loop {
+        let update = admission.updates.borrow_and_update().clone();
+        match update.job.state {
+            MiningState::Completed => {
+                let hashes = update
+                    .hashes
+                    .context("Completed mining job omitted its hashes")?;
+                return Ok(Json(json!({"blocks":hashes.len(),"hashes":*hashes})));
+            }
+            MiningState::Failed => {
+                return Err(anyhow::anyhow!(
+                    update
+                        .job
+                        .error
+                        .context("Failed mining job omitted its error")?
+                )
+                .into());
+            }
+            MiningState::Mining | MiningState::Syncing => {}
+        }
+        admission
+            .updates
+            .changed()
+            .await
+            .context("Mining job update channel closed before completion")?;
+    }
 }
 
 #[derive(Deserialize)]
@@ -1206,7 +1323,12 @@ async fn seed(
     ))
 }
 async fn block(State(state): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {
-    let mut block = state.0.rpc.block(&id).await?;
+    let mut block = state
+        .0
+        .rpc
+        .block(&id)
+        .await
+        .map_err(|e| not_found(e, NO_BLOCK))?;
     // `getblock` has no Ironwood root, but `z_gettreestate` does. The root is
     // an extra detail, so a failed lookup still returns the block.
     if let Some(hash) = block.get("hash").and_then(Value::as_str).map(str::to_owned) {
@@ -1314,7 +1436,12 @@ async fn transaction(
     State(state): State<AppState>,
     Path(txid): Path<String>,
 ) -> ApiResult<Json<Value>> {
-    let mut tx = state.0.rpc.transaction(&txid).await?;
+    let mut tx = state
+        .0
+        .rpc
+        .transaction(&txid)
+        .await
+        .map_err(|e| not_found(e, NO_TRANSACTION))?;
     let mut prev_txs = std::collections::HashMap::new();
     for prev_id in transparent_prevout_ids(&tx) {
         if let Ok(prev) = state.0.rpc.transaction(&prev_id).await {
@@ -1350,11 +1477,40 @@ async fn search(
     if query.q.starts_with('t') {
         return address(State(state), Path(query.q)).await;
     }
-    if let Ok(block) = state.0.rpc.block(&query.q).await {
-        return Ok(Json(json!({"type":"block","value":block})));
+    // Only a 64-character hash can also be a txid; anything else is answered by the block lookup.
+    // Other node failures must surface rather than fall through to the transaction lookup.
+    match state.0.rpc.block(&query.q).await {
+        Ok(block) => return Ok(Json(json!({"type":"block","value":block}))),
+        Err(error) => {
+            let error = not_found(error, NO_BLOCK);
+            if query.q.len() != 64 || error.status != StatusCode::NOT_FOUND {
+                return Err(error);
+            }
+        }
     }
-    let tx = state.0.rpc.transaction(&query.q).await?;
+    let tx = state
+        .0
+        .rpc
+        .transaction(&query.q)
+        .await
+        .map_err(|e| not_found(e, NO_BLOCK_OR_TRANSACTION))?;
     Ok(Json(json!({"type":"transaction","value":tx})))
+}
+
+const NO_BLOCK: &str = "No block at that height or hash on this chain.";
+const NO_TRANSACTION: &str =
+    "No transaction with that ID on this chain. It may not have been mined yet.";
+const NO_BLOCK_OR_TRANSACTION: &str = "No block or transaction on this chain has that hash.";
+
+/// Zakura answers an unknown or unparseable block or transaction with -5 or -8.
+fn not_found(error: anyhow::Error, message: &str) -> ApiError {
+    match error.downcast_ref::<RpcError>().map(|error| error.code) {
+        Some(-5 | -8) => ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        },
+        _ => error.into(),
+    }
 }
 
 async fn events(
@@ -1433,17 +1589,7 @@ fn notify(state: &AppState, topic: &str) {
     let _ = state.0.events.send(topic.to_owned());
 }
 fn require_key(key: &str) -> ApiResult<()> {
-    if key.len() < 8 || key.len() > 128 {
-        Err(ApiError::bad_request(
-            "idempotency_key must contain 8-128 characters",
-        ))
-    } else if !key.bytes().all(|byte| byte.is_ascii_graphic()) {
-        Err(ApiError::bad_request(
-            "idempotency_key must contain only visible ASCII characters",
-        ))
-    } else {
-        Ok(())
-    }
+    validate_idempotency_key(key).map_err(ApiError::bad_request)
 }
 
 fn require_pool(pool: &str, field: &str) -> ApiResult<()> {
@@ -1466,13 +1612,13 @@ fn validate_send(req: &SendRequest) -> ApiResult<Option<MemoBytes>> {
     require_key(&req.idempotency_key)?;
     require_user_account(req.from_account)?;
     require_user_account(req.to_account)?;
-    if req.from_account == req.to_account {
-        return Err(ApiError::bad_request(
-            "from_account and to_account must be different accounts",
-        ));
-    }
     require_pool(&req.source_pool, "source_pool")?;
     require_pool(&req.destination_pool, "destination_pool")?;
+    if req.from_account == req.to_account && req.source_pool == req.destination_pool {
+        return Err(ApiError::bad_request(
+            "choose a different account or a different destination pool",
+        ));
+    }
     if req.amount_zatoshi == 0 || req.amount_zatoshi > MAX_MONEY {
         return Err(ApiError::bad_request(format!(
             "amount_zatoshi must be between 1 and {MAX_MONEY}"
@@ -1541,6 +1687,21 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
+        }
+    }
+}
+impl From<MiningAdmissionError> for ApiError {
+    fn from(error: MiningAdmissionError) -> Self {
+        let status = match error {
+            MiningAdmissionError::InvalidBlocks | MiningAdmissionError::InvalidKey => {
+                StatusCode::BAD_REQUEST
+            }
+            MiningAdmissionError::KeyConflict | MiningAdmissionError::Busy => StatusCode::CONFLICT,
+            MiningAdmissionError::Capacity => StatusCode::SERVICE_UNAVAILABLE,
+        };
+        Self {
+            status,
+            message: error.to_string(),
         }
     }
 }
@@ -1662,13 +1823,474 @@ mod tests {
         assert_eq!(body, "console.log(1)");
     }
 
-    /// A misconfigured TSZ_WEB_DIR should fail visibly rather than serving an
+    /// A misconfigured THS_WEB_DIR should fail visibly rather than serving an
     /// empty 200 that looks like a working dashboard.
     #[tokio::test]
     async fn a_missing_shell_is_reported_rather_than_served_empty() {
         let dir = tempfile::tempdir().expect("temp dir");
         let (status, _) = get(&dir, "/wallet").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn mining_adapter_rejects_missing_empty_and_multiple_rpc_hashes() {
+        for hashes in [json!([]), json!([""]), json!(["hash-one", "hash-two"])] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let rpc_calls = calls.clone();
+            let rpc = Router::new().route("/", post(move |Json(request): Json<Value>| {
+                let hashes = hashes.clone();
+                let calls = rpc_calls.clone();
+                async move {
+                    assert_eq!(request["method"], "generate");
+                    assert_eq!(request["params"], json!([1]));
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"jsonrpc":"2.0","id":request["id"],"result":hashes,"error":null}))
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, rpc).await.unwrap();
+            });
+            let (mut state, _dir) = state_with_local_wallet();
+            Arc::get_mut(&mut state.0).unwrap().rpc = NodeRpc::new(endpoint);
+            let app = router(state);
+            let (status, _) = mining_request(
+                &app,
+                "POST",
+                "/api/v1/mining/jobs",
+                json!({"blocks":2,"idempotency_key":"malformed-hashes"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::ACCEPTED);
+            let failed = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let (_, value) =
+                        mining_request(&app, "GET", "/api/v1/mining/jobs", Value::Null).await;
+                    if value["job"]["state"] == "failed" {
+                        break value["job"].clone();
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(failed["completed_blocks"], 0);
+            assert_eq!(failed["progress_uncertain"], true);
+            assert!(
+                failed["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("exactly one nonempty")
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                mining_request(
+                    &app,
+                    "POST",
+                    "/api/v1/mining/jobs",
+                    json!({"blocks":2,"idempotency_key":"malformed-hashes"})
+                )
+                .await,
+                (StatusCode::ACCEPTED, failed)
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            server.abort();
+            assert!(server.await.unwrap_err().is_cancelled());
+        }
+    }
+
+    #[tokio::test]
+    async fn mining_adapter_accepts_one_nonempty_rpc_hash_and_forwards_events() {
+        let rpc = Router::new().route(
+            "/",
+            post(|Json(request): Json<Value>| async move {
+                assert_eq!(request["method"], "generate");
+                assert_eq!(request["params"], json!([1]));
+                Json(json!({"result":["one-hash"],"error":null,"id":request["id"]}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, rpc).await.unwrap();
+        });
+        let (mut state, _dir) = state_with_local_wallet();
+        Arc::get_mut(&mut state.0).unwrap().rpc = NodeRpc::new(endpoint);
+        let mut events = state.0.events.subscribe();
+        let adapter = ManualMiningAdapter(state);
+        assert_eq!(adapter.generate_one().await.unwrap(), "one-hash");
+        adapter.notify("mining");
+        assert_eq!(events.recv().await.unwrap(), "mining");
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    struct ManualMiningRuntime {
+        permits: tokio::sync::Semaphore,
+        sync_permits: tokio::sync::Semaphore,
+        calls: AtomicUsize,
+        entered: tokio::sync::Notify,
+        fail_sync: bool,
+    }
+
+    impl ManualMiningRuntime {
+        fn blocked() -> Self {
+            Self {
+                permits: tokio::sync::Semaphore::new(0),
+                sync_permits: tokio::sync::Semaphore::new(1),
+                calls: AtomicUsize::new(0),
+                entered: tokio::sync::Notify::new(),
+                fail_sync: false,
+            }
+        }
+
+        async fn wait_for_first_call(&self) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let notified = self.entered.notified();
+                    if self.calls.load(Ordering::SeqCst) > 0 {
+                        return;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+
+        fn release(&self, blocks: usize) {
+            self.permits.add_permits(blocks);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MiningRuntime for ManualMiningRuntime {
+        async fn generate_one(&self) -> anyhow::Result<String> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            self.entered.notify_one();
+            self.permits.acquire().await.unwrap().forget();
+            Ok(format!("hash-{call}"))
+        }
+
+        async fn synchronize(&self, tip_hash: &str) -> anyhow::Result<()> {
+            assert!(tip_hash.starts_with("hash-"));
+            self.sync_permits.acquire().await.unwrap().forget();
+            anyhow::ensure!(!self.fail_sync, "injected wallet sync failure");
+            Ok(())
+        }
+
+        fn notify(&self, _topic: &'static str) {}
+    }
+
+    fn state_with_mining(
+        runtime: Arc<dyn MiningRuntime>,
+        capacity: usize,
+    ) -> (AppState, tempfile::TempDir) {
+        let (mut state, dir) = state_with_local_wallet();
+        let inner = Arc::get_mut(&mut state.0).unwrap();
+        inner.mining_runtime = Some(runtime);
+        inner.mining = Arc::new(MiningCoordinator::with_capacity(capacity));
+        (state, dir)
+    }
+
+    async fn mining_request(
+        app: &Router,
+        method: &str,
+        path: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    async fn completed_mining(app: &Router) -> Value {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (status, value) =
+                    mining_request(app, "GET", "/api/v1/mining/jobs", Value::Null).await;
+                assert_eq!(status, StatusCode::OK);
+                if value["job"]["state"] == "completed" {
+                    return value["job"].clone();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn mining_routes_validate_admit_replay_and_preserve_capacity_history() {
+        let runtime = Arc::new(ManualMiningRuntime::blocked());
+        let (state, _dir) = state_with_mining(runtime.clone(), 1);
+        let app = router(state);
+        assert_eq!(
+            mining_request(&app, "GET", "/api/v1/mining/jobs", Value::Null).await,
+            (StatusCode::OK, json!({"job":null}))
+        );
+        for body in [
+            json!({"blocks":0,"idempotency_key":"valid-key"}),
+            json!({"blocks":10001,"idempotency_key":"valid-key"}),
+            json!({"blocks":1,"idempotency_key":"short"}),
+            json!({"blocks":1,"idempotency_key":"space key"}),
+            json!({"blocks":1,"idempotency_key":"nonasciié"}),
+            json!({"blocks":1,"idempotency_key":"x".repeat(129)}),
+            json!({"blocks":1,"idempotency_key":"control\n"}),
+        ] {
+            let (status, value) = mining_request(&app, "POST", "/api/v1/mining/jobs", body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(value["error"]["status"], 400);
+            assert!(value["error"]["message"].as_str().unwrap().len() > 5);
+        }
+        let body = json!({"blocks":3,"idempotency_key":"valid-key"});
+        let (status, first) =
+            mining_request(&app, "POST", "/api/v1/mining/jobs", body.clone()).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(first["requested_blocks"], 3);
+        assert_eq!(first["completed_blocks"], 0);
+        assert_eq!(first["state"], "mining");
+        assert_eq!(first["error"], Value::Null);
+        assert_eq!(first["progress_uncertain"], false);
+        let id = first["id"].as_str().unwrap();
+        assert_eq!(
+            mining_request(
+                &app,
+                "GET",
+                &format!("/api/v1/mining/jobs/{id}"),
+                Value::Null
+            )
+            .await,
+            (StatusCode::OK, first.clone())
+        );
+        assert_eq!(
+            mining_request(&app, "POST", "/api/v1/mining/jobs", body.clone()).await,
+            (StatusCode::ACCEPTED, first.clone())
+        );
+        for conflict in [
+            json!({"blocks":2,"idempotency_key":"valid-key"}),
+            json!({"blocks":3,"idempotency_key":"another-key"}),
+        ] {
+            let (status, error) =
+                mining_request(&app, "POST", "/api/v1/mining/jobs", conflict).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(error["error"]["status"], 409);
+        }
+        let (status, error) =
+            mining_request(&app, "POST", "/api/v1/mine", json!({"blocks":1})).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error["error"]["status"], 409);
+        let (status, error) =
+            mining_request(&app, "GET", "/api/v1/mining/jobs/unknown", Value::Null).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(error["error"]["status"], 404);
+        runtime.release(3);
+        let completed = completed_mining(&app).await;
+        assert_eq!(completed["completed_blocks"], 3);
+        assert_eq!(
+            mining_request(&app, "POST", "/api/v1/mining/jobs", body).await,
+            (StatusCode::ACCEPTED, completed.clone())
+        );
+        assert_eq!(
+            mining_request(
+                &app,
+                "GET",
+                &format!("/api/v1/mining/jobs/{id}"),
+                Value::Null
+            )
+            .await,
+            (StatusCode::OK, completed)
+        );
+        let (status, error) = mining_request(
+            &app,
+            "POST",
+            "/api/v1/mining/jobs",
+            json!({"blocks":1,"idempotency_key":"another-key"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error["error"]["status"], 503);
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("capacity")
+        );
+        let (status, error) =
+            mining_request(&app, "POST", "/api/v1/mine", json!({"blocks":1})).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error["error"]["status"], 503);
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn mining_legacy_waits_for_sync_and_preserves_full_response() {
+        let runtime = Arc::new(ManualMiningRuntime {
+            sync_permits: tokio::sync::Semaphore::new(0),
+            ..ManualMiningRuntime::blocked()
+        });
+        let (state, _dir) = state_with_mining(runtime.clone(), 2);
+        let app = router(state);
+        for blocks in [0, 10001] {
+            assert_eq!(
+                mining_request(&app, "POST", "/api/v1/mine", json!({"blocks":blocks}))
+                    .await
+                    .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let request_app = app.clone();
+        let task = tokio::spawn(async move {
+            mining_request(&request_app, "POST", "/api/v1/mine", json!({"blocks":3})).await
+        });
+        runtime.wait_for_first_call().await;
+        assert!(!task.is_finished());
+        runtime.release(3);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (_, value) =
+                    mining_request(&app, "GET", "/api/v1/mining/jobs", Value::Null).await;
+                if value["job"]["state"] == "syncing" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!task.is_finished());
+        runtime.sync_permits.add_permits(1);
+        assert_eq!(
+            task.await.unwrap(),
+            (
+                StatusCode::OK,
+                json!({"blocks":3,"hashes":["hash-1","hash-2","hash-3"]})
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn mining_legacy_sync_failure_uses_error_envelope() {
+        let runtime = Arc::new(ManualMiningRuntime {
+            fail_sync: true,
+            ..ManualMiningRuntime::blocked()
+        });
+        runtime.release(1);
+        let (state, _dir) = state_with_mining(runtime, 1);
+        let (status, error) =
+            mining_request(&router(state), "POST", "/api/v1/mine", json!({"blocks":1})).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error["error"]["status"], 500);
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("Blocks mined, but wallet synchronization failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn mining_survives_http_disconnect_and_discarded_async_response() {
+        let runtime = Arc::new(ManualMiningRuntime::blocked());
+        let (state, _dir) = state_with_mining(runtime.clone(), 2);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(state)).await.unwrap();
+        });
+        let url = base_url.clone();
+        let client_task = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("{url}/api/v1/mine"))
+                .json(&json!({"blocks":3}))
+                .send()
+                .await
+        });
+        runtime.wait_for_first_call().await;
+        client_task.abort();
+        assert!(client_task.await.unwrap_err().is_cancelled());
+        runtime.release(3);
+        let client = reqwest::Client::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let value: Value = client
+                    .get(format!("{base_url}/api/v1/mining/jobs"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                if value["job"]["state"] == "completed" {
+                    assert_eq!(value["job"]["completed_blocks"], 3);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let body = json!({"blocks":1,"idempotency_key":"discarded-response"});
+        drop(
+            client
+                .post(format!("{base_url}/api/v1/mining/jobs"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap(),
+        );
+        let replay = client
+            .post(format!("{base_url}/api/v1/mining/jobs"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::ACCEPTED);
+        let replay: Value = replay.json().await.unwrap();
+        runtime.sync_permits.add_permits(1);
+        runtime.release(1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let value: Value = client
+                    .get(format!(
+                        "{base_url}/api/v1/mining/jobs/{}",
+                        replay["id"].as_str().unwrap()
+                    ))
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                if value["state"] == "completed" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(runtime.calls.load(Ordering::SeqCst), 4);
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
     }
 
     fn state_with_local_wallet() -> (AppState, tempfile::TempDir) {
@@ -2128,6 +2750,35 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn send_validation_allows_same_account_only_between_pools() {
+        for to in [1, 2] {
+            for source in ["ironwood", "transparent"] {
+                for destination in ["ironwood", "transparent"] {
+                    let mut body = valid_send();
+                    body["to_account"] = json!(to);
+                    body["source_pool"] = json!(source);
+                    body["destination_pool"] = json!(destination);
+                    let req = serde_json::from_value::<SendRequest>(body).unwrap();
+                    let result = validate_send(&req);
+                    if to == 1 && source == destination {
+                        let error = result.unwrap_err();
+                        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+                        assert_eq!(
+                            error.message,
+                            "choose a different account or a different destination pool"
+                        );
+                    } else {
+                        assert!(
+                            matches!(result, Ok(None)),
+                            "{to}: {source} -> {destination}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn invalid_sends_are_rejected_before_replay_or_synchronization() {
         let (state, _dir) = offline_state();
@@ -2157,7 +2808,34 @@ mod tests {
                 "treasury account",
                 with(&[("to_account", json!(TREASURY_ACCOUNT_ID))]),
             ),
-            ("same account", with(&[("to_account", json!(1))])),
+            ("same account and pool", with(&[("to_account", json!(1))])),
+            (
+                "same account and transparent pool",
+                with(&[
+                    ("to_account", json!(1)),
+                    ("source_pool", json!("transparent")),
+                    ("destination_pool", json!("transparent")),
+                ]),
+            ),
+            (
+                "same account and unsupported source",
+                with(&[("to_account", json!(1)), ("source_pool", json!("sapling"))]),
+            ),
+            (
+                "same account and unsupported destination",
+                with(&[
+                    ("to_account", json!(1)),
+                    ("destination_pool", json!("orchard")),
+                ]),
+            ),
+            (
+                "same account unshield with memo",
+                with(&[
+                    ("to_account", json!(1)),
+                    ("destination_pool", json!("transparent")),
+                    ("memo", json!("hi")),
+                ]),
+            ),
             (
                 "bad source pool",
                 with(&[("source_pool", json!("sapling"))]),
@@ -2197,6 +2875,54 @@ mod tests {
                 .id,
             original.id
         );
+    }
+
+    #[tokio::test]
+    async fn same_account_cross_pool_replays_preserve_activity_and_identity() {
+        for (source, destination) in [("ironwood", "transparent"), ("transparent", "ironwood")] {
+            let (state, _dir) = offline_state();
+            let original = state
+                .0
+                .store
+                .claim_transfer(1, 1, source, destination, 100_000, REPLAY_KEY, None)
+                .unwrap();
+            state
+                .0
+                .store
+                .record_prepared(&original.id, "txid", b"signed transaction", 0)
+                .unwrap();
+            state.0.store.mark_broadcast(&original.id, "txid").unwrap();
+            state
+                .0
+                .store
+                .confirm(&original.id, "txid", &"c".repeat(64))
+                .unwrap();
+            let before = activity_ids(&state);
+            let mut body = valid_send();
+            body["to_account"] = json!(1);
+            body["source_pool"] = json!(source);
+            body["destination_pool"] = json!(destination);
+            for _ in 0..2 {
+                let (status, response) = post_send(&state, &body).await;
+                assert_eq!(status, StatusCode::OK, "{response}");
+                assert_eq!(response["id"], original.id);
+                assert_eq!(response["txid"], "txid");
+                assert_eq!(response["from_account"], 1);
+                assert_eq!(response["to_account"], 1);
+                assert_eq!(response["source_pool"], source);
+                assert_eq!(response["destination_pool"], destination);
+            }
+            for changed in [("amount_zatoshi", json!(100_001)), ("to_account", json!(2))] {
+                let mut conflict = body.clone();
+                conflict[changed.0] = changed.1;
+                assert_eq!(post_send(&state, &conflict).await.0, StatusCode::CONFLICT);
+            }
+            let mut reverse = body.clone();
+            reverse["source_pool"] = json!(destination);
+            reverse["destination_pool"] = json!(source);
+            assert_eq!(post_send(&state, &reverse).await.0, StatusCode::CONFLICT);
+            assert_eq!(activity_ids(&state), before);
+        }
     }
 
     #[tokio::test]
@@ -2273,6 +2999,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn explorer_reports_unknown_blocks_and_transactions_as_404() {
+        // A node that knows nothing, answering with Zakura's not-found codes.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node = format!("http://{}", listener.local_addr().unwrap());
+        let not_found = Router::new().route(
+            "/",
+            post(|Json(req): Json<Value>| async move {
+                let code = if req["method"] == "getblock" { -8 } else { -5 };
+                Json(json!({"error": {"code": code, "message": "not found"}}))
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, not_found).await });
+
+        let (state, _dir) = state_with_local_wallet();
+        let state = AppState::new(
+            state.0.store.clone(),
+            state.0.wallet.clone(),
+            node,
+            "test".into(),
+        );
+        let hash = "a".repeat(64);
+        for path in [
+            "/api/v1/blocks/999999".to_owned(),
+            format!("/api/v1/transactions/{hash}"),
+            "/api/v1/search?q=999999".to_owned(),
+            format!("/api/v1/search?q={hash}"),
+        ] {
+            let response = router(state.clone())
+                .oneshot(Request::get(&path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn search_does_not_mask_a_block_node_failure_as_404() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node = format!("http://{}", listener.local_addr().unwrap());
+        let failing = Router::new().route(
+            "/",
+            post(|Json(req): Json<Value>| async move {
+                let code = if req["method"] == "getblock" { -28 } else { -5 };
+                Json(json!({"error": {"code": code, "message": "injected"}}))
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, failing).await });
+
+        let (state, _dir) = state_with_local_wallet();
+        let state = AppState::new(
+            state.0.store.clone(),
+            state.0.wallet.clone(),
+            node,
+            "t".into(),
+        );
+        let uri = format!("/api/v1/search?q={}", "a".repeat(64));
+        let response = router(state)
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
@@ -2520,38 +3310,44 @@ mod tests {
 
     #[tokio::test]
     async fn retry_submits_the_same_prepared_transaction_after_a_lost_response() {
-        let store = Store::open(":memory:").unwrap();
-        store.initialize().unwrap();
-        let claim = store
-            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
-            .unwrap();
-        store
-            .record_prepared(&claim.id, "real-txid", b"signed transaction", 140)
-            .unwrap();
-        let prepared = store.activity_for_key("same").unwrap().unwrap();
-        let runtime = RecordingPaymentSubmitter {
-            lookups: Mutex::new(VecDeque::from([
-                Ok(false),
-                Err("node unavailable"),
-                Ok(false),
-            ])),
-            height: AtomicU64::new(139),
-            fail_next: AtomicBool::new(true),
-            ..Default::default()
-        };
+        for (to, source, destination) in [
+            (2, "ironwood", "ironwood"),
+            (1, "ironwood", "transparent"),
+            (1, "transparent", "ironwood"),
+        ] {
+            let store = Store::open(":memory:").unwrap();
+            store.initialize().unwrap();
+            let claim = store
+                .claim_transfer(1, to, source, destination, 12_000, "same", None)
+                .unwrap();
+            store
+                .record_prepared(&claim.id, "real-txid", b"signed transaction", 140)
+                .unwrap();
+            let prepared = store.activity_for_key("same").unwrap().unwrap();
+            let runtime = RecordingPaymentSubmitter {
+                lookups: Mutex::new(VecDeque::from([
+                    Ok(false),
+                    Err("node unavailable"),
+                    Ok(false),
+                ])),
+                height: AtomicU64::new(139),
+                fail_next: AtomicBool::new(true),
+                ..Default::default()
+            };
 
-        assert!(submit_prepared(&store, &runtime, &prepared).await.is_err());
-        assert_eq!(
-            store.activity_for_key("same").unwrap().unwrap().status,
-            "prepared"
-        );
+            assert!(submit_prepared(&store, &runtime, &prepared).await.is_err());
+            assert_eq!(
+                store.activity_for_key("same").unwrap().unwrap().status,
+                "prepared"
+            );
 
-        let broadcast = submit_prepared(&store, &runtime, &prepared).await.unwrap();
-        assert!(matches!(broadcast, PreparedSubmission::Broadcast(_)));
-        assert_eq!(
-            runtime.broadcasts.into_inner().unwrap(),
-            [b"signed transaction", b"signed transaction"]
-        );
+            let broadcast = submit_prepared(&store, &runtime, &prepared).await.unwrap();
+            assert!(matches!(broadcast, PreparedSubmission::Broadcast(_)));
+            assert_eq!(
+                runtime.broadcasts.into_inner().unwrap(),
+                [b"signed transaction", b"signed transaction"]
+            );
+        }
     }
 
     #[tokio::test]

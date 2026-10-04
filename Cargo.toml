@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/tsz-cli", "crates/tsz-server"]
+members = ["crates/ths-cli", "crates/ths-server"]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT"
@@ -42,4 +42,3 @@ inherits = "dev"
 
 [profile.dev-runtime.package."*"]
 opt-level = 3
-

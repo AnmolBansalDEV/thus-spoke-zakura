@@ -1,5 +1,5 @@
 [package]
-name = "tsz-server"
+name = "ths-server"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -51,6 +51,8 @@ zip321 = { package = "zakura-zip321", version = "=2.2.0" }
 # `oneshot` drives the router in tests without binding a socket.
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
+h2 = "0.4"
+tokio = { workspace = true, features = ["test-util"] }
 # The wallet SDK's in-memory chain/scanner harness for proposal-level tests.
 zcash_client_backend = { package = "zakura-client-backend", version = "=0.1.0-rc7", features = ["test-dependencies"] }
 zcash_client_sqlite = { package = "zakura-client-sqlite", version = "=0.1.0-rc7", features = ["test-dependencies"] }
