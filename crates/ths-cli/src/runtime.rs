@@ -177,7 +177,7 @@ impl Runtime {
             .read_instance(name)
             .map(|i| i.endpoints)
             .or_else(|_| inspect_endpoints(&prefix(name)))?;
-        let running = container_running(&format!("{}-app", prefix(name))).unwrap_or(false);
+        let running = container_running(&format!("{}-app", prefix(name)))?;
         if json {
             println!(
                 "{}",
@@ -207,7 +207,7 @@ impl Runtime {
 
     pub fn mine(&self, name: &InstanceName, blocks: u32, json: bool) -> Result<()> {
         let app_container = format!("{}-app", prefix(name));
-        if !container_running(&app_container).unwrap_or(false) {
+        if !container_running(&app_container)? {
             bail!("environment {name} is not running; start it with `ths --name {name}`");
         }
         let dashboard = self.read_instance(name)?.endpoints.dashboard;
@@ -245,7 +245,7 @@ impl Runtime {
         json: bool,
     ) -> Result<()> {
         let app_container = format!("{}-app", prefix(name));
-        if !container_running(&app_container).unwrap_or(false) {
+        if !container_running(&app_container)? {
             bail!("environment {name} is not running; start it with `ths --name {name}`");
         }
         let dashboard = self.read_instance(name)?.endpoints.dashboard;
@@ -290,7 +290,7 @@ impl Runtime {
         json: bool,
     ) -> Result<()> {
         let app_container = format!("{}-app", prefix(name));
-        if !container_running(&app_container).unwrap_or(false) {
+        if !container_running(&app_container)? {
             bail!("environment {name} is not running; start it with `ths --name {name}`");
         }
         let dashboard = self.read_instance(name)?.endpoints.dashboard;
@@ -362,7 +362,7 @@ impl Runtime {
         json: bool,
     ) -> Result<()> {
         let app_container = format!("{}-app", prefix(name));
-        if !container_running(&app_container).unwrap_or(false) {
+        if !container_running(&app_container)? {
             bail!("environment {name} is not running; start it with `ths --name {name}`");
         }
         let dashboard = self.read_instance(name)?.endpoints.dashboard;
@@ -495,19 +495,30 @@ impl Runtime {
         }
         for suffix in ["chain", "wallet", "lightwalletd", "config"] {
             let volume = format!("{prefix}-{suffix}");
-            if docker_output(["volume", "inspect", &volume]).is_ok()
-                && let Err(error) = docker(["volume", "rm", &volume])
-            {
-                failures.push(format!("volume {volume}: {error}"));
+            match volume_exists(&volume) {
+                Ok(true) => {
+                    if let Err(error) = docker(["volume", "rm", &volume]) {
+                        failures.push(format!("volume {volume}: {error}"));
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => failures.push(format!("volume {volume}: {error}")),
             }
         }
-        if docker_output(["network", "inspect", &prefix]).is_ok()
-            && let Err(error) = docker(["network", "rm", &prefix])
-        {
-            failures.push(format!("network {prefix}: {error}"));
+        match network_exists(&prefix) {
+            Ok(true) => {
+                if let Err(error) = docker(["network", "rm", &prefix]) {
+                    failures.push(format!("network {prefix}: {error}"));
+                }
+            }
+            Ok(false) => {}
+            Err(error) => failures.push(format!("network {prefix}: {error}")),
         }
+        // Keep the metadata while Docker resources may remain, so the environment stays
+        // listed and `ths stop` can be repeated once Docker recovers.
         let dir = self.instance_dir(name);
-        if dir.exists()
+        if failures.is_empty()
+            && dir.exists()
             && let Err(error) = fs::remove_dir_all(&dir)
         {
             failures.push(format!("metadata {}: {error}", dir.display()));
@@ -759,12 +770,37 @@ fn published_port(container: &str, port: &str) -> Result<u16> {
     .context("Docker returned an invalid published port")
 }
 fn container_exists(name: &str) -> Result<bool> {
-    container_listed(&format!("name=^{name}$"))
+    docker_listed([
+        "container",
+        "ls",
+        "--all",
+        "--quiet",
+        "--filter",
+        &format!("name=^{name}$"),
+    ])
 }
-/// `docker container inspect` fails the same way for a missing container and an unreachable
-/// daemon, so existence comes from a filtered listing: empty means gone, failure stays an error.
-fn container_listed(filter: &str) -> Result<bool> {
-    Ok(!docker_output(["container", "ls", "--all", "--quiet", "--filter", filter])?.is_empty())
+fn volume_exists(name: &str) -> Result<bool> {
+    docker_listed([
+        "volume",
+        "ls",
+        "--quiet",
+        "--filter",
+        &format!("name=^{name}$"),
+    ])
+}
+fn network_exists(name: &str) -> Result<bool> {
+    docker_listed([
+        "network",
+        "ls",
+        "--quiet",
+        "--filter",
+        &format!("name=^{name}$"),
+    ])
+}
+/// `docker inspect` fails the same way for a missing object and an unreachable daemon, so
+/// existence comes from a filtered listing: empty means absent, failure stays an error.
+fn docker_listed<const N: usize>(args: [&str; N]) -> Result<bool> {
+    Ok(!docker_output(args)?.is_empty())
 }
 fn ensure_image(image: &str) -> Result<()> {
     if docker_output(["image", "inspect", image]).is_err() {
@@ -992,7 +1028,14 @@ impl ContainerEvents for DockerEvents {
     }
 
     fn exists(&self, id: &str) -> Result<bool> {
-        container_listed(&format!("id={id}"))
+        docker_listed([
+            "container",
+            "ls",
+            "--all",
+            "--quiet",
+            "--filter",
+            &format!("id={id}"),
+        ])
     }
 
     fn wait_destroyed(&self, container: &WatchedContainer) -> Result<bool> {
@@ -1002,7 +1045,7 @@ impl ContainerEvents for DockerEvents {
             if self.cancelled.load(Ordering::SeqCst) {
                 return Ok(false);
             }
-            let mut child = Command::new("docker")
+            let mut child = docker_cli()
                 .args([
                     "events",
                     "--since",
@@ -1316,14 +1359,15 @@ impl Runtime {
     }
 }
 
+/// Lists only running containers, so a stopped or missing one is `false` rather than an error.
 fn container_running(name: &str) -> Result<bool> {
-    Ok(docker_output([
+    docker_listed([
         "container",
-        "inspect",
-        "--format",
-        "{{.State.Running}}",
-        name,
-    ])? == "true")
+        "ls",
+        "--quiet",
+        "--filter",
+        &format!("name=^{name}$"),
+    ])
 }
 fn wait_ready(
     base: &str,
@@ -1343,7 +1387,7 @@ fn wait_ready(
         {
             return Ok(());
         }
-        if !container_running(app_container).unwrap_or(false) {
+        if !container_running(app_container)? {
             let logs = docker_logs(app_container)
                 .unwrap_or_else(|error| format!("could not read app logs: {error}"));
             bail!("app exited before becoming healthy:\n{logs}");
@@ -1392,7 +1436,7 @@ fn wait_for_zakura_tip(
         if tip_available {
             return Ok(());
         }
-        if !container_running(container).unwrap_or(false) {
+        if !container_running(container)? {
             let logs = docker_logs(container)
                 .unwrap_or_else(|error| format!("could not read Zakura logs: {error}"));
             bail!("Zakura exited before its RPC tip became available:\n{logs}");
@@ -1432,6 +1476,15 @@ fn open_url(url: &str) -> Result<()> {
         .with_context(|| format!("opening {url}"))?;
     Ok(())
 }
+fn docker_cli() -> Command {
+    #[allow(unused_mut)]
+    let mut command = Command::new("docker");
+    #[cfg(test)]
+    if tests::DOCKER_UNREACHABLE.get() {
+        command.env("DOCKER_HOST", "unix:///nonexistent/ths-tests/docker.sock");
+    }
+    command
+}
 fn docker<const N: usize>(args: [&str; N]) -> Result<()> {
     docker_inherit(&args)
 }
@@ -1442,7 +1495,7 @@ fn docker_inherit_in(args: &[&str], current_dir: &std::path::Path) -> Result<()>
     docker_command(args, Some(current_dir))
 }
 fn docker_command(args: &[&str], current_dir: Option<&std::path::Path>) -> Result<()> {
-    let mut command = Command::new("docker");
+    let mut command = docker_cli();
     command.args(args);
     if let Some(current_dir) = current_dir {
         command.current_dir(current_dir);
@@ -1454,17 +1507,14 @@ fn docker_command(args: &[&str], current_dir: Option<&std::path::Path>) -> Resul
     Ok(())
 }
 fn docker_output<const N: usize>(args: [&str; N]) -> Result<String> {
-    let output = Command::new("docker")
-        .args(args)
-        .output()
-        .context("running Docker")?;
+    let output = docker_cli().args(args).output().context("running Docker")?;
     if !output.status.success() {
         bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
     }
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
 }
 fn docker_logs(container: &str) -> Result<String> {
-    let output = Command::new("docker")
+    let output = docker_cli()
         .args(["logs", "--tail", "50", container])
         .output()
         .context("running Docker")?;
@@ -1480,6 +1530,67 @@ fn docker_logs(container: &str) -> Result<String> {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    thread_local! {
+        /// Points this test thread's Docker commands at a daemon that does not exist.
+        pub(super) static DOCKER_UNREACHABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn with_unreachable_docker<T>(test: impl FnOnce() -> T) -> T {
+        DOCKER_UNREACHABLE.set(true);
+        let result = test();
+        DOCKER_UNREACHABLE.set(false);
+        result
+    }
+
+    #[test]
+    fn docker_errors_are_not_reported_as_missing_resources() {
+        with_unreachable_docker(|| {
+            assert!(container_exists("ths-alpha-app").is_err());
+            assert!(container_running("ths-alpha-app").is_err());
+            assert!(volume_exists("ths-alpha-chain").is_err());
+            assert!(network_exists("ths-alpha").is_err());
+            assert!(DockerEvents::default().identify("ths-alpha-app").is_err());
+            assert!(DockerEvents::default().exists("0123abcd").is_err());
+        });
+    }
+
+    #[test]
+    fn deleting_keeps_metadata_while_docker_is_unreachable() {
+        let runtime = Runtime {
+            root: std::env::temp_dir().join(format!("ths-unreachable-{}", std::process::id())),
+        };
+        let name = name("alpha");
+        fs::create_dir_all(runtime.instance_dir(&name)).unwrap();
+        runtime
+            .write_instance(&name, &endpoints_for(&host_ports(0).unwrap()))
+            .unwrap();
+        let err = with_unreachable_docker(|| runtime.stop(&name)).unwrap_err();
+        let message = err.to_string();
+        for resource in [
+            "container ths-alpha-app",
+            "volume ths-alpha-chain",
+            "network ths-alpha",
+        ] {
+            assert!(
+                message.contains(resource),
+                "{resource} missing from {message}"
+            );
+        }
+        assert!(runtime.read_instance(&name).is_ok(), "metadata was deleted");
+        fs::remove_dir_all(&runtime.root).unwrap();
+    }
+
+    #[test]
+    fn commands_report_docker_errors_instead_of_a_stopped_environment() {
+        let runtime = runtime_for_tests();
+        let name = name("alpha");
+        let err = with_unreachable_docker(|| runtime.mine(&name, 1, false)).unwrap_err();
+        assert!(
+            !err.to_string().contains("is not running"),
+            "reported a Docker error as a stopped environment: {err}"
+        );
+    }
 
     struct RecordingHost {
         events: Arc<Mutex<Vec<String>>>,
