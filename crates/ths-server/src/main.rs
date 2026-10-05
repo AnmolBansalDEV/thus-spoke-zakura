@@ -1,5 +1,6 @@
 mod api;
 mod db;
+mod mining;
 mod reconcile;
 mod rpc;
 mod wallet;
