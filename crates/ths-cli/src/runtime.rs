@@ -1,6 +1,7 @@
 use std::{
+    collections::BTreeMap,
     fmt::{self, Display},
-    fs,
+    fs::{self, File, OpenOptions, TryLockError},
     path::PathBuf,
     process::{Command, Stdio},
     str::FromStr,
@@ -91,7 +92,13 @@ struct FaucetResult {
     address: String,
     amount_zatoshi: u64,
     txid: String,
-    block_hash: String,
+    block_hash: Option<String>,
+    #[serde(default = "confirmed_status")]
+    status: String,
+}
+
+fn confirmed_status() -> String {
+    "confirmed".to_owned()
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -110,6 +117,107 @@ struct Activity {
 
 pub struct Runtime {
     root: PathBuf,
+}
+
+struct FaucetJournal {
+    path: PathBuf,
+    _lock: File,
+}
+
+impl FaucetJournal {
+    fn open(instance_dir: &std::path::Path) -> Result<Self> {
+        let lock = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(instance_dir.join("faucet-intents.lock"))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                bail!(
+                    "another faucet command is running for this environment; retry after it finishes"
+                )
+            }
+            Err(TryLockError::Error(error)) => {
+                return Err(error).context("locking faucet intents");
+            }
+        }
+        Ok(Self {
+            path: instance_dir.join("faucet-intents.json"),
+            _lock: lock,
+        })
+    }
+
+    fn read(&self) -> Result<BTreeMap<String, String>> {
+        match fs::read(&self.path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).context("invalid saved faucet intents"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+            Err(error) => Err(error).context("reading saved faucet intents"),
+        }
+    }
+
+    fn write(&self, entries: &BTreeMap<String, String>) -> Result<()> {
+        let temporary = self.path.with_extension("json.tmp");
+        let file = File::create(&temporary)?;
+        serde_json::to_writer(&file, entries)?;
+        file.sync_all()?;
+        fs::rename(&temporary, &self.path)?;
+        File::open(
+            self.path
+                .parent()
+                .context("faucet intent directory is missing")?,
+        )?
+        .sync_all()?;
+        Ok(())
+    }
+
+    fn key_for(&self, intent: &str) -> Result<String> {
+        let mut entries = self.read()?;
+        if let Some(key) = entries.get(intent) {
+            return Ok(key.clone());
+        }
+        let key = uuid::Uuid::new_v4().to_string();
+        entries.insert(intent.to_owned(), key.clone());
+        self.write(&entries)?;
+        Ok(key)
+    }
+
+    fn wallet_batch(&self, pool: &str, amount: u64, accounts: &[u8]) -> Result<String> {
+        let mut canonical = accounts.to_vec();
+        canonical.sort_unstable();
+        if canonical.is_empty() || canonical.windows(2).any(|pair| pair[0] == pair[1]) {
+            bail!("accounts must contain unique account indices");
+        }
+        let account_list = canonical
+            .iter()
+            .map(u8::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let prefix = format!("wallet:{pool}:{amount}:");
+        for intent in self.read()?.keys() {
+            if let Some((prior_list, _)) = intent
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.rsplit_once(':'))
+                && prior_list != account_list
+                && let Some(overlap) = account_list
+                    .split(',')
+                    .find(|id| prior_list.split(',').any(|prior| prior == *id))
+            {
+                bail!(
+                    "account {overlap} belongs to an unfinished faucet batch; retry with --accounts {prior_list}"
+                );
+            }
+        }
+        Ok(format!("{prefix}{account_list}"))
+    }
+
+    fn clear(&self, intents: &[&str]) -> Result<()> {
+        let mut entries = self.read()?;
+        for intent in intents {
+            entries.remove(*intent);
+        }
+        self.write(&entries)
+    }
 }
 
 impl Runtime {
@@ -248,6 +356,9 @@ impl Runtime {
             bail!("environment {name} is not running; start it with `ths --name {name}`");
         }
         let dashboard = self.read_instance(name)?.endpoints.dashboard;
+        let journal = FaucetJournal::open(&self.instance_dir(name))?;
+        let intent = format!("address:{address}:{amount_zatoshi}");
+        let idempotency_key = journal.key_for(&intent)?;
         let response = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(300))
             .build()?
@@ -255,6 +366,7 @@ impl Runtime {
             .json(&serde_json::json!({
                 "address": address,
                 "amount_zatoshi": amount_zatoshi,
+                "idempotency_key": idempotency_key,
             }))
             .send()
             .with_context(|| format!("asking environment {name} to fund {address}"))?;
@@ -266,18 +378,35 @@ impl Runtime {
             bail!("environment {name} rejected faucet request ({status}): {detail}");
         }
         let result: FaucetResult = response.json().context("decoding faucet response")?;
+        if result.status == "confirmed" && result.block_hash.is_none() {
+            bail!("faucet reported confirmation without a block hash; retry the same command");
+        }
+        if result.status == "confirmed" {
+            journal.clear(&[&intent])?;
+        }
         if json {
             println!("{}", serde_json::to_string_pretty(&result)?);
         } else {
-            println!(
-                "Sent {} ZEC to {} on {name}.",
-                format_zec(result.amount_zatoshi),
-                result.address
-            );
             println!("Transaction: {}", result.txid);
-            println!("Confirmed in: {}", result.block_hash);
+            if let Some(block_hash) = &result.block_hash {
+                println!(
+                    "Sent {} ZEC to {} on {name}.",
+                    format_zec(result.amount_zatoshi),
+                    result.address
+                );
+                println!("Confirmed in: {block_hash}");
+            } else {
+                println!(
+                    "Payment to {} is pending. Run the same command to check it again.",
+                    result.address
+                );
+            }
         }
-        Ok(())
+        if result.status == "confirmed" {
+            Ok(())
+        } else {
+            bail!("faucet payment is pending; run the same command to check it again")
+        }
     }
 
     pub fn wallet_faucet(
@@ -293,14 +422,17 @@ impl Runtime {
             bail!("environment {name} is not running; start it with `ths --name {name}`");
         }
         let dashboard = self.read_instance(name)?.endpoints.dashboard;
+        let journal = FaucetJournal::open(&self.instance_dir(name))?;
+        let batch = journal.wallet_batch(pool, amount_zatoshi, accounts)?;
+        let intents: Vec<_> = accounts.iter().map(|id| format!("{batch}:{id}")).collect();
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(300))
             .build()?;
         let mut funded = Vec::new();
+        let mut pending = Vec::new();
         let mut failures = Vec::new();
-        for &account_id in accounts {
-            let idempotency_key =
-                format!("ths-wallet-faucet-{account_id}-{}", uuid::Uuid::new_v4());
+        for (&account_id, intent) in accounts.iter().zip(&intents) {
+            let idempotency_key = journal.key_for(intent)?;
             let outcome = client
                 .post(format!("{dashboard}/api/v1/faucet"))
                 .json(&serde_json::json!({
@@ -312,15 +444,19 @@ impl Runtime {
                 .send()
                 .with_context(|| format!("asking environment {name} to fund account {account_id}"));
             match outcome.and_then(decode_activity) {
-                Ok(activity) => funded.push(activity),
+                Ok(activity) if activity.status == "confirmed" => funded.push(activity),
+                Ok(activity) => pending.push(activity),
                 Err(error) => failures.push(format!("account {account_id}: {error:#}")),
             }
+        }
+        if failures.is_empty() && pending.is_empty() {
+            journal.clear(&intents.iter().map(String::as_str).collect::<Vec<_>>())?;
         }
         if json {
             println!(
                 "{}",
                 serde_json::to_string_pretty(
-                    &serde_json::json!({"funded": funded, "failed": failures})
+                    &serde_json::json!({"funded": funded, "pending": pending, "failed": failures})
                 )?
             );
         } else {
@@ -333,16 +469,22 @@ impl Runtime {
                 );
                 println!("  Transaction: {}", activity.txid);
             }
+            for activity in &pending {
+                eprintln!(
+                    "Payment to account {} is pending ({}). Run the same command to check it again.",
+                    activity.to_account, activity.txid
+                );
+            }
             for failure in &failures {
                 eprintln!("Failed to fund {failure}");
             }
         }
-        if failures.is_empty() {
+        if failures.is_empty() && pending.is_empty() {
             Ok(())
         } else {
             bail!(
-                "{} of {} faucet requests failed",
-                failures.len(),
+                "{} of {} faucet requests are pending or failed",
+                failures.len() + pending.len(),
                 accounts.len()
             )
         }
@@ -1883,6 +2025,106 @@ mod tests {
                 "network rm owned-network",
             ]
         );
+    }
+
+    #[test]
+    fn faucet_keys_survive_cli_restart_until_the_whole_intent_is_confirmed() {
+        let dir = std::env::temp_dir().join(format!("ths-faucet-journal-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let first = FaucetJournal::open(&dir).unwrap();
+        let account_one = first.key_for("wallet:ironwood:100:1,2:1").unwrap();
+        let account_two = first.key_for("wallet:ironwood:100:1,2:2").unwrap();
+        drop(first);
+
+        let retry = FaucetJournal::open(&dir).unwrap();
+        assert_eq!(
+            retry.key_for("wallet:ironwood:100:1,2:1").unwrap(),
+            account_one
+        );
+        assert_eq!(
+            retry.key_for("wallet:ironwood:100:1,2:2").unwrap(),
+            account_two
+        );
+        retry
+            .clear(&["wallet:ironwood:100:1,2:1", "wallet:ironwood:100:1,2:2"])
+            .unwrap();
+        drop(retry);
+
+        let next = FaucetJournal::open(&dir).unwrap();
+        assert_ne!(
+            next.key_for("wallet:ironwood:100:1,2:1").unwrap(),
+            account_one
+        );
+        drop(next);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn overlapping_faucet_process_rejects_the_locked_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = FaucetJournal::open(dir.path()).unwrap();
+        let mut retry = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "runtime::tests::faucet_journal_lock_probe"])
+            .env("THS_FAUCET_JOURNAL_LOCK_PROBE", dir.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let completed_while_locked = loop {
+            if retry.try_wait().unwrap().is_some() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        drop(journal);
+        let output = retry.wait_with_output().unwrap();
+        let result = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            completed_while_locked && output.status.success() && result.contains("running 1 test"),
+            "overlapping command waited or acquired the lock: {result}"
+        );
+    }
+
+    #[test]
+    fn faucet_journal_lock_probe() {
+        let Some(dir) = std::env::var_os("THS_FAUCET_JOURNAL_LOCK_PROBE") else {
+            return;
+        };
+        let error = FaucetJournal::open(std::path::Path::new(&dir))
+            .err()
+            .expect("overlapping command acquired the lock");
+        assert!(
+            error
+                .to_string()
+                .contains("another faucet command is running")
+        );
+    }
+
+    #[test]
+    fn unfinished_wallet_batch_rejects_an_overlapping_subset() {
+        let dir = std::env::temp_dir().join(format!("ths-faucet-batch-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let journal = FaucetJournal::open(&dir).unwrap();
+        let batch = journal.wallet_batch("ironwood", 100, &[1, 2]).unwrap();
+        journal.key_for(&format!("{batch}:1")).unwrap();
+        assert!(journal.wallet_batch("ironwood", 100, &[2]).is_err());
+        journal.key_for(&format!("{batch}:2")).unwrap();
+
+        assert_eq!(
+            journal.wallet_batch("ironwood", 100, &[2, 1]).unwrap(),
+            batch
+        );
+        assert!(journal.wallet_batch("ironwood", 100, &[2]).is_err());
+        journal
+            .clear(&[&format!("{batch}:1"), &format!("{batch}:2")])
+            .unwrap();
+        assert!(journal.wallet_batch("ironwood", 100, &[2]).is_ok());
+        drop(journal);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
