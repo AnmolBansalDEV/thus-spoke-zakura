@@ -17,6 +17,9 @@ use zcash_protocol::local_consensus::LocalNetwork;
 pub const ZATOSHIS_PER_ZEC: u64 = 100_000_000;
 pub const USER_ACCOUNT_COUNT: u8 = 5;
 pub const TREASURY_ACCOUNT_ID: u8 = 6;
+/// The order must match `row_account`.
+const ACCOUNT_COLUMNS: &str =
+    "id,name,unified_address,transparent_address,transparent_zatoshi,ironwood_zatoshi";
 /// Qualified so it also reads unambiguously in joins. The order must match `row_activity`.
 const ACTIVITY_COLUMNS: &str = "a.id,a.kind,a.from_account,a.to_account,a.source_pool,a.destination_pool,a.amount_zatoshi,a.txid,a.block_hash,a.status,a.created_at";
 
@@ -150,7 +153,9 @@ impl Store {
     pub fn accounts(&self) -> Result<Vec<Account>> {
         let mut accounts = {
             let db = self.0.lock().unwrap();
-            let mut query = db.prepare("SELECT id,name,unified_address,transparent_address,transparent_zatoshi,ironwood_zatoshi FROM accounts ORDER BY id")?;
+            let mut query = db.prepare(&format!(
+                "SELECT {ACCOUNT_COLUMNS} FROM accounts ORDER BY id"
+            ))?;
             query
                 .query_map([], row_account)?
                 .collect::<rusqlite::Result<Vec<_>>>()?
@@ -176,7 +181,15 @@ impl Store {
     }
 
     pub fn account(&self, id: u8) -> Result<Account> {
-        self.0.lock().unwrap().query_row("SELECT id,name,unified_address,transparent_address,transparent_zatoshi,ironwood_zatoshi FROM accounts WHERE id=?1", [id], row_account).with_context(|| format!("account {id} does not exist"))
+        self.0
+            .lock()
+            .unwrap()
+            .query_row(
+                &format!("SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE id=?1"),
+                [id],
+                row_account,
+            )
+            .with_context(|| format!("account {id} does not exist"))
     }
 
     pub fn activities(&self, limit: u32) -> Result<Vec<Activity>> {
