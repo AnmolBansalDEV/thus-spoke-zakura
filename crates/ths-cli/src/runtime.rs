@@ -1204,8 +1204,8 @@ impl Runtime {
         }
         host.wait_for_shutdown(shutdown)?;
         println!("\nStopping and deleting {name}…");
-        cleanup.active = false;
         host.delete(self, name)?;
+        cleanup.active = false;
         println!("Deleted {name} and all of its development data.");
         Ok(())
     }
@@ -1691,6 +1691,7 @@ mod tests {
     struct RecordingHost {
         events: Arc<Mutex<Vec<String>>>,
         initial_delete_error: bool,
+        shutdown_collision: Option<RecordingDocker>,
         wait_ready_result: Result<(), String>,
         open_url_result: Result<(), String>,
         interrupt_before_ready: bool,
@@ -1703,6 +1704,7 @@ mod tests {
                 Self {
                     events: events.clone(),
                     initial_delete_error: false,
+                    shutdown_collision: None,
                     wait_ready_result: Ok(()),
                     open_url_result: Ok(()),
                     interrupt_before_ready: false,
@@ -1717,12 +1719,31 @@ mod tests {
     }
 
     impl StartHost for RecordingHost {
-        fn delete(&self, _runtime: &Runtime, name: &InstanceName) -> Result<()> {
+        fn delete(&self, runtime: &Runtime, name: &InstanceName) -> Result<()> {
             self.push(&format!("delete:{name}"));
             if self.initial_delete_error {
                 bail!("resource collision");
             }
+            if self
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event == "wait_for_shutdown")
+                && let Some(docker) = &self.shutdown_collision
+            {
+                return runtime.delete_instance_resources_with(name, docker);
+            }
             Ok(())
+        }
+
+        fn delete_partial(&self, runtime: &Runtime, name: &InstanceName) -> Result<()> {
+            if let Some(docker) = &self.shutdown_collision {
+                self.push(&format!("delete_partial:{name}"));
+                runtime.delete_instance_resources_with_mode(name, docker, true)
+            } else {
+                self.delete(runtime, name)
+            }
         }
 
         fn allocate(
@@ -1772,7 +1793,11 @@ mod tests {
 
         fn wait_for_shutdown(&self, shutdown: &Shutdown) -> Result<()> {
             self.push("wait_for_shutdown");
-            shutdown.wait()
+            if self.shutdown_collision.is_some() {
+                Ok(())
+            } else {
+                shutdown.wait()
+            }
         }
     }
 
@@ -1799,6 +1824,65 @@ mod tests {
 
         assert!(error.to_string().contains("resource collision"));
         assert_eq!(*events.lock().unwrap(), ["delete:alpha"]);
+    }
+
+    #[test]
+    fn shutdown_collision_removes_owned_resources_and_preserves_foreign_container() {
+        let mut docker = RecordingDocker::new(
+            "ths-alpha-app\nths-alpha-init",
+            "ths-alpha-wallet",
+            "ths-alpha",
+        );
+        docker.inspect(
+            "container",
+            "ths-alpha-app",
+            r#"[{"Id":"owned-app","Config":{"Labels":{"com.zakura.ths.instance":"alpha"}}}]"#,
+        );
+        docker.inspect(
+            "container",
+            "ths-alpha-init",
+            r#"[{"Id":"foreign-init","Config":{"Labels":{}}}]"#,
+        );
+        docker.inspect(
+            "volume",
+            "ths-alpha-wallet",
+            r#"[{"Name":"ths-alpha-wallet","Labels":{"com.zakura.ths.instance":"alpha"}}]"#,
+        );
+        docker.inspect(
+            "network",
+            "ths-alpha",
+            r#"[{"Id":"owned-network","Labels":{"com.zakura.ths.instance":"alpha"}}]"#,
+        );
+        let (mut host, events) = RecordingHost::new();
+        host.shutdown_collision = Some(docker);
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let shutdown = Shutdown::from_receiver(receiver);
+
+        let error = runtime_for_tests()
+            .start_with(&name("alpha"), true, false, 0, &host, &shutdown)
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("ths-alpha-init is not owned"));
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .contains(&"delete_partial:alpha".into())
+        );
+        assert_eq!(
+            *host
+                .shutdown_collision
+                .as_ref()
+                .unwrap()
+                .runs
+                .lock()
+                .unwrap(),
+            [
+                "rm -f owned-app",
+                "volume rm ths-alpha-wallet",
+                "network rm owned-network",
+            ]
+        );
     }
 
     #[test]
