@@ -94,6 +94,49 @@ describe('useTheme', () => {
     expect(document.documentElement.getAttribute('data-theme')).toBe('dark');
   });
 
+  it('follows storage again once a write lands', async () => {
+    // The sequence the review asked for: a refused write, then one that lands,
+    // then another tab's change. A refusal flag that never clears would ignore
+    // the last step and the control would stay on this tab's own selection.
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementationOnce(() => {
+      throw new DOMException('storage is blocked', 'SecurityError');
+    });
+    const { result } = await mountTheme();
+
+    act(() => result.current[1]('dark'));
+    expect(result.current[0]).toBe('dark');
+
+    act(() => result.current[1]('light'));
+    expect(result.current[0]).toBe('light');
+    expect(localStorage.getItem(THEME_STORAGE_KEY)).toBe('light');
+
+    act(() => {
+      localStorage.removeItem(THEME_STORAGE_KEY);
+      window.dispatchEvent(new StorageEvent('storage', { key: THEME_STORAGE_KEY, newValue: null }));
+    });
+    expect(result.current[0]).toBe('system');
+  });
+
+  it('follows storage again once a read succeeds', async () => {
+    // The read side of the same property: a refusal must not outlive the read.
+    const getItem = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
+      throw new DOMException('storage is blocked', 'SecurityError');
+    });
+    const { result } = await mountTheme();
+
+    act(() => result.current[1]('dark'));
+    expect(result.current[0]).toBe('dark');
+
+    getItem.mockRestore();
+    act(() => {
+      localStorage.setItem(THEME_STORAGE_KEY, 'light');
+      window.dispatchEvent(
+        new StorageEvent('storage', { key: THEME_STORAGE_KEY, newValue: 'light' }),
+      );
+    });
+    expect(result.current[0]).toBe('light');
+  });
+
   it('keeps the selection when storage reads but refuses the write', async () => {
     refuseStorage('setItem');
     const { result } = await mountTheme();
