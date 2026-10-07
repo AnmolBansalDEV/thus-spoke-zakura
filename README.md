@@ -308,7 +308,7 @@ cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery
 
 The first command compiles the integration target. The second runs its
 Docker-free helper coverage and leaves the ignored live regression unexecuted.
-The final five commands explicitly select the live regressions; Cargo supplies that
+The remaining Cargo commands explicitly select the live regressions; Cargo supplies that
 target with the matching source-built `ths-server` binary, including when
 `CARGO_TARGET_DIR` is set. Do not substitute an installed or older binary.
 

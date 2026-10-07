@@ -69,6 +69,16 @@ pub struct Activity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressFaucet {
+    pub id: String,
+    pub address: String,
+    pub amount_zatoshi: u64,
+    pub txid: String,
+    pub block_hash: Option<String>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedTransaction {
     pub raw_transaction: Vec<u8>,
     pub expiry_height: u64,
@@ -105,6 +115,11 @@ impl Store {
             CREATE TABLE IF NOT EXISTS prepared_payments (
                 activity_id TEXT PRIMARY KEY, raw_transaction BLOB NOT NULL,
                 expiry_height INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS address_faucets (
+                key TEXT PRIMARY KEY, id TEXT UNIQUE NOT NULL, address TEXT NOT NULL,
+                amount_zatoshi INTEGER NOT NULL, txid TEXT NOT NULL DEFAULT '',
+                block_hash TEXT, status TEXT NOT NULL DEFAULT 'preparing'
             );
         "#)?;
         let has_memo = db
@@ -234,6 +249,9 @@ impl Store {
             }
             return Ok(activity);
         }
+        if address_for_key(&db, key)?.is_some() {
+            return Err(IdempotencyConflict.into());
+        }
         for id in [from, to] {
             if !db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM accounts WHERE id=?1)",
@@ -267,6 +285,9 @@ impl Store {
             ensure_same_payment(&activity, "faucet", None, to, "ironwood", pool, amount)?;
             return Ok(activity);
         }
+        if address_for_key(&db, key)?.is_some() {
+            return Err(IdempotencyConflict.into());
+        }
         if !db.query_row(
             "SELECT EXISTS(SELECT 1 FROM accounts WHERE id=?1)",
             [to],
@@ -279,6 +300,116 @@ impl Store {
         insert_activity(&tx, &activity, key, None)?;
         tx.commit()?;
         Ok(activity)
+    }
+
+    pub fn address_faucet_for_key(&self, key: &str) -> Result<Option<AddressFaucet>> {
+        let db = self.0.lock().unwrap();
+        address_for_key(&db, key)
+    }
+
+    pub fn claim_address_faucet(
+        &self,
+        address: &str,
+        amount: u64,
+        key: &str,
+    ) -> Result<AddressFaucet> {
+        if amount == 0 {
+            bail!("amount must be greater than zero");
+        }
+        let db = self.0.lock().unwrap();
+        if let Some(payment) = address_for_key(&db, key)? {
+            if payment.address != address || payment.amount_zatoshi != amount {
+                return Err(IdempotencyConflict.into());
+            }
+            return Ok(payment);
+        }
+        if activity_for_key(&db, key)?.is_some() {
+            return Err(IdempotencyConflict.into());
+        }
+        let id = Uuid::new_v4().to_string();
+        db.execute(
+            "INSERT INTO address_faucets(key,id,address,amount_zatoshi) VALUES(?1,?2,?3,?4)",
+            params![key, id, address, amount],
+        )?;
+        address_for_key(&db, key)?.context("address faucet claim was not stored")
+    }
+
+    pub fn discard_address_preparing(&self, id: &str) -> Result<()> {
+        self.0.lock().unwrap().execute(
+            "DELETE FROM address_faucets WHERE id=?1 AND status='preparing'",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_address_prepared(
+        &self,
+        id: &str,
+        txid: &str,
+        raw_transaction: &[u8],
+        expiry_height: u64,
+    ) -> Result<AddressFaucet> {
+        let mut db = self.0.lock().unwrap();
+        let tx = db.transaction()?;
+        let updated = tx.execute(
+            "UPDATE address_faucets SET txid=?1,status='prepared' WHERE id=?2 AND status='preparing'",
+            params![txid, id],
+        )?;
+        let payment = address_by_id(&tx, id)?;
+        if updated == 0
+            && (payment.txid != txid
+                || !matches!(
+                    payment.status.as_str(),
+                    "prepared" | "broadcast" | "confirmed"
+                ))
+        {
+            bail!("address faucet {id} is not waiting for this prepared transaction");
+        }
+        tx.execute(
+            "INSERT INTO prepared_payments(activity_id,raw_transaction,expiry_height) VALUES(?1,?2,?3) ON CONFLICT(activity_id) DO NOTHING",
+            params![id, raw_transaction, expiry_height],
+        )?;
+        tx.commit()?;
+        Ok(payment)
+    }
+
+    pub fn reset_address_for_retry(&self, id: &str, txid: &str) -> Result<AddressFaucet> {
+        let mut db = self.0.lock().unwrap();
+        let tx = db.transaction()?;
+        if tx.execute(
+            "UPDATE address_faucets SET txid='',block_hash=NULL,status='preparing' WHERE id=?1 AND txid=?2 AND status IN ('prepared','broadcast')",
+            params![id, txid],
+        )? == 1 {
+            tx.execute("DELETE FROM prepared_payments WHERE activity_id=?1", [id])?;
+        }
+        let payment = address_by_id(&tx, id)?;
+        tx.commit()?;
+        Ok(payment)
+    }
+
+    pub fn mark_address_broadcast(&self, id: &str, txid: &str) -> Result<AddressFaucet> {
+        let db = self.0.lock().unwrap();
+        let updated = db.execute(
+            "UPDATE address_faucets SET status='broadcast' WHERE id=?1 AND txid=?2 AND status IN ('prepared','broadcast')",
+            params![id, txid],
+        )?;
+        let payment = address_by_id(&db, id)?;
+        if updated == 0 && (payment.txid != txid || payment.status != "confirmed") {
+            bail!("address faucet {id} has no matching prepared transaction");
+        }
+        Ok(payment)
+    }
+
+    pub fn confirm_address(&self, id: &str, txid: &str, block_hash: &str) -> Result<AddressFaucet> {
+        if block_hash.is_empty() {
+            bail!("block hash is required to confirm address faucet");
+        }
+        let db = self.0.lock().unwrap();
+        db.execute(
+            "UPDATE address_faucets SET status='confirmed',block_hash=?1 WHERE id=?2 AND txid=?3",
+            params![block_hash, id, txid],
+        )?;
+        address_by_id(&db, id)
     }
 
     pub fn discard_preparing(&self, id: &str) -> Result<()> {
@@ -451,6 +582,33 @@ fn activity_for_key(db: &Connection, key: &str) -> Result<Option<Activity>> {
     .optional()
     .map_err(Into::into)
 }
+fn address_for_key(db: &Connection, key: &str) -> Result<Option<AddressFaucet>> {
+    db.query_row(
+        "SELECT id,address,amount_zatoshi,txid,block_hash,status FROM address_faucets WHERE key=?1",
+        [key],
+        row_address_faucet,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+fn address_by_id(db: &Connection, id: &str) -> Result<AddressFaucet> {
+    db.query_row(
+        "SELECT id,address,amount_zatoshi,txid,block_hash,status FROM address_faucets WHERE id=?1",
+        [id],
+        row_address_faucet,
+    )
+    .map_err(Into::into)
+}
+fn row_address_faucet(row: &rusqlite::Row<'_>) -> rusqlite::Result<AddressFaucet> {
+    Ok(AddressFaucet {
+        id: row.get(0)?,
+        address: row.get(1)?,
+        amount_zatoshi: row.get(2)?,
+        txid: row.get(3)?,
+        block_hash: row.get(4)?,
+        status: row.get(5)?,
+    })
+}
 fn new_activity(
     kind: &str,
     from: Option<u8>,
@@ -561,6 +719,91 @@ fn local_network() -> LocalNetwork {
 mod tests {
     use super::*;
     use std::sync::Barrier;
+    #[test]
+    fn address_faucet_replay_survives_restart_and_rejects_conflicting_intents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.db");
+        let store = Store::open(&path).unwrap();
+        store.initialize().unwrap();
+        let address = store.account(1).unwrap().unified_address;
+        let first = store
+            .claim_address_faucet(&address, 100_000_000, "address-key")
+            .unwrap();
+        let first = store
+            .record_address_prepared(&first.id, "txid-one", b"signed bytes", 140)
+            .unwrap();
+        assert_eq!(first.status, "prepared");
+        drop(store);
+
+        let reopened = Store::open(&path).unwrap();
+        reopened.initialize().unwrap();
+        let replay = reopened
+            .claim_address_faucet(&address, 100_000_000, "address-key")
+            .unwrap();
+        assert_eq!(replay.id, first.id);
+        assert_eq!(replay.txid, "txid-one");
+        assert_eq!(
+            reopened
+                .prepared_transaction(&replay.id)
+                .unwrap()
+                .raw_transaction,
+            b"signed bytes"
+        );
+        assert!(
+            reopened
+                .claim_address_faucet(&address, 2, "address-key")
+                .is_err()
+        );
+        assert!(
+            reopened
+                .claim_address_faucet(
+                    &reopened.account(2).unwrap().unified_address,
+                    100_000_000,
+                    "address-key"
+                )
+                .is_err()
+        );
+        assert!(
+            reopened
+                .claim_faucet(1, "ironwood", 100_000_000, "address-key")
+                .is_err()
+        );
+        assert!(
+            reopened
+                .claim_address_faucet(&address, 100_000_000, "fresh-key")
+                .is_ok()
+        );
+        reopened
+            .claim_faucet(1, "ironwood", 100_000_000, "account-key")
+            .unwrap();
+        assert!(
+            reopened
+                .claim_address_faucet(&address, 100_000_000, "account-key")
+                .is_err()
+        );
+    }
+    #[test]
+    fn concurrent_address_faucet_claims_share_one_operation() {
+        let store = Store::open(":memory:").unwrap();
+        store.initialize().unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let claims: Vec<_> = (0..2)
+            .map(|_| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.claim_address_faucet("same-address", 1, "same-operation")
+                })
+            })
+            .collect();
+        barrier.wait();
+        let ids: Vec<_> = claims
+            .into_iter()
+            .map(|claim| claim.join().unwrap().unwrap().id)
+            .collect();
+        assert_eq!(ids[0], ids[1]);
+    }
     #[test]
     fn creates_user_accounts_and_hidden_treasury() {
         let store = Store::open(":memory:").unwrap();
