@@ -271,6 +271,7 @@ impl Runtime {
         json: bool,
         port_offset: u16,
     ) -> Result<()> {
+        host_ports(port_offset)?;
         self.doctor(false)?;
         for image in [app_image(), lightwalletd_image(), ZAKURA_IMAGE.to_owned()] {
             require_image(&image)?;
@@ -741,10 +742,18 @@ fn host_ports(offset: u16) -> Result<HostPorts> {
         bail!("--port-offset must be a multiple of 10 (got {offset})");
     }
     Ok(HostPorts {
-        dashboard: 32805 + offset,
-        rpc: 18232 + offset,
-        p2p: 18233 + offset,
-        lightwalletd: 9067 + offset,
+        dashboard: 32805u16
+            .checked_add(offset)
+            .with_context(|| format!("--port-offset {offset} overflows the dashboard port"))?,
+        rpc: 18232u16
+            .checked_add(offset)
+            .with_context(|| format!("--port-offset {offset} overflows the Zakura RPC port"))?,
+        p2p: 18233u16
+            .checked_add(offset)
+            .with_context(|| format!("--port-offset {offset} overflows the P2P port"))?,
+        lightwalletd: 9067u16
+            .checked_add(offset)
+            .with_context(|| format!("--port-offset {offset} overflows the lightwalletd port"))?,
     })
 }
 
@@ -1315,6 +1324,7 @@ impl Runtime {
         host: &dyn StartHost,
         shutdown: &Shutdown,
     ) -> Result<()> {
+        host_ports(port_offset)?;
         let mut cleanup = CleanupOnDrop {
             runtime: self,
             name,
@@ -2359,6 +2369,33 @@ mod tests {
     fn port_offset_rejects_values_that_are_not_multiples_of_ten() {
         let err = host_ports(1).unwrap_err();
         assert!(err.to_string().contains('1'));
+    }
+
+    #[test]
+    fn port_offset_accepts_the_largest_value_that_keeps_every_port_in_range() {
+        let ports = host_ports(32730).unwrap();
+        assert_eq!(ports.dashboard, 65535);
+    }
+
+    #[test]
+    fn port_offset_rejects_values_that_overflow_a_host_port() {
+        let err = host_ports(32740).unwrap_err();
+        assert!(err.to_string().contains("overflow"));
+    }
+
+    #[test]
+    fn invalid_port_offset_is_rejected_before_any_deletion_or_allocation() {
+        let (mut host, events) = RecordingHost::new();
+        host.initial_delete_error = true;
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let shutdown = Shutdown::from_receiver(receiver);
+
+        let error = runtime_for_tests()
+            .start_with(&name("alpha"), false, false, 32740, &host, &shutdown)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("overflow"));
+        assert!(events.lock().unwrap().is_empty());
     }
 
     #[test]
