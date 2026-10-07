@@ -12,6 +12,9 @@ use rusqlite::{Connection, OpenFlags, params};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex;
+use transparent::address::TransparentAddress;
+use zcash_keys::address::Address;
+use zcash_protocol::{consensus::BlockHeight, local_consensus::LocalNetwork};
 
 use support::{
     FailureRoute, GenerateCounts, HeightCheckpoint, RecoveryFailureReporter, RecoveryPhase,
@@ -74,6 +77,130 @@ struct AccountBalance {
     id: u8,
     ironwood_zatoshi: u64,
     transparent_zatoshi: u64,
+}
+
+#[derive(Deserialize)]
+struct AddressFaucetResult {
+    address: String,
+    amount_zatoshi: u64,
+    txid: String,
+    block_hash: Option<String>,
+    status: String,
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Docker and prepared regtest images"]
+async fn address_faucet_retry_after_server_restart_pays_each_destination_once() -> Result<()> {
+    let server = PathBuf::from(env!("CARGO_BIN_EXE_ths-server"));
+    let mut fixture = RegtestStack::new(server)?;
+    let scenario = async {
+        fixture.start().await?;
+        let client = Client::new();
+        let accounts: serde_json::Value = request_json(
+            &client,
+            fixture.api_url(),
+            "/api/v1/accounts",
+            None,
+            API_READ_TIMEOUT,
+        )
+        .await?;
+        let internal = accounts
+            .as_array()
+            .and_then(|accounts| accounts.iter().find(|account| account["id"] == 2))
+            .and_then(|account| account["transparent_address"].as_str())
+            .ok_or_else(|| anyhow::anyhow!("Account 2 transparent address is missing"))?
+            .to_owned();
+        let one = Some(BlockHeight::from_u32(1));
+        let network = LocalNetwork {
+            overwinter: one,
+            sapling: one,
+            blossom: one,
+            heartwood: one,
+            canopy: one,
+            nu5: one,
+            nu6: one,
+            nu6_1: one,
+            nu6_2: one,
+            nu6_3: one,
+            nu7: None,
+        };
+        let external =
+            Address::Transparent(TransparentAddress::PublicKeyHash([42; 20])).encode(&network);
+        for (address, key) in [
+            (internal, "internal-restart-faucet"),
+            (external, "external-restart-faucet"),
+        ] {
+            fixture.proxy().fail_next_generate()?;
+            let body = json!({
+                "address": address, "amount_zatoshi": 1_000_000,
+                "idempotency_key": key,
+            });
+            let first: AddressFaucetResult = request_json(
+                &client,
+                fixture.api_url(),
+                "/api/v1/faucet/address",
+                Some(&body),
+                SEND_TIMEOUT,
+            )
+            .await?;
+            anyhow::ensure!(
+                first.status == "broadcast" && first.block_hash.is_none(),
+                "injected auto-mine failure did not leave the payment pending"
+            );
+            let mempool: Vec<String> =
+                rpc(&client, fixture.node_url(), "getrawmempool", json!([])).await?;
+            anyhow::ensure!(
+                mempool.contains(&first.txid),
+                "original transaction is absent from the mempool"
+            );
+
+            // Discard the first result as a client with a lost response would, then restart the app.
+            fixture.restart_server().await?;
+            let replay: AddressFaucetResult = request_json(
+                &client,
+                fixture.api_url(),
+                "/api/v1/faucet/address",
+                Some(&body),
+                SEND_TIMEOUT,
+            )
+            .await?;
+            anyhow::ensure!(
+                replay.status == "confirmed" && replay.txid == first.txid,
+                "retry constructed another payment instead of confirming the original"
+            );
+            anyhow::ensure!(
+                replay.address == address && replay.amount_zatoshi == 1_000_000,
+                "replayed payment changed its destination or amount"
+            );
+            let tx: serde_json::Value = rpc(
+                &client,
+                fixture.node_url(),
+                "getrawtransaction",
+                json!([first.txid, 1]),
+            )
+            .await?;
+            anyhow::ensure!(
+                tx["blockhash"].as_str() == replay.block_hash.as_deref(),
+                "response block hash differs from the confirmed transaction"
+            );
+            let balance: serde_json::Value = rpc(
+                &client,
+                fixture.node_url(),
+                "getaddressbalance",
+                json!([{"addresses": [address]}]),
+            )
+            .await?;
+            anyhow::ensure!(
+                balance["balance"] == 1_000_000,
+                "destination received more or less than one intended payout"
+            );
+        }
+        fixture.assert_running().await?;
+        Ok(())
+    }
+    .await;
+    let cleanup = fixture.shutdown().await;
+    preserve_scenario_failure(scenario, cleanup)
 }
 
 #[tokio::test(flavor = "multi_thread")]
