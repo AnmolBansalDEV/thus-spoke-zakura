@@ -22,6 +22,8 @@ const ACCOUNT_COLUMNS: &str =
     "id,name,unified_address,transparent_address,transparent_zatoshi,ironwood_zatoshi";
 /// Qualified so it also reads unambiguously in joins. The order must match `row_activity`.
 const ACTIVITY_COLUMNS: &str = "a.id,a.kind,a.from_account,a.to_account,a.source_pool,a.destination_pool,a.amount_zatoshi,a.txid,a.block_hash,a.status,a.created_at";
+/// The order must match `row_address_faucet`.
+const ADDRESS_FAUCET_COLUMNS: &str = "id,address,amount_zatoshi,txid,block_hash,status";
 
 #[derive(Debug, thiserror::Error)]
 #[error("idempotency key was already used for a different payment")]
@@ -579,7 +581,7 @@ fn activity_for_key(db: &Connection, key: &str) -> Result<Option<Activity>> {
 }
 fn address_for_key(db: &Connection, key: &str) -> Result<Option<AddressFaucet>> {
     db.query_row(
-        "SELECT id,address,amount_zatoshi,txid,block_hash,status FROM address_faucets WHERE key=?1",
+        &format!("SELECT {ADDRESS_FAUCET_COLUMNS} FROM address_faucets WHERE key=?1"),
         [key],
         row_address_faucet,
     )
@@ -588,7 +590,7 @@ fn address_for_key(db: &Connection, key: &str) -> Result<Option<AddressFaucet>> 
 }
 fn address_by_id(db: &Connection, id: &str) -> Result<AddressFaucet> {
     db.query_row(
-        "SELECT id,address,amount_zatoshi,txid,block_hash,status FROM address_faucets WHERE id=?1",
+        &format!("SELECT {ADDRESS_FAUCET_COLUMNS} FROM address_faucets WHERE id=?1"),
         [id],
         row_address_faucet,
     )
