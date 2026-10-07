@@ -302,6 +302,11 @@ impl Store {
         Ok(activity)
     }
 
+    pub fn address_faucet_for_key(&self, key: &str) -> Result<Option<AddressFaucet>> {
+        let db = self.0.lock().unwrap();
+        address_for_key(&db, key)
+    }
+
     pub fn claim_address_faucet(
         &self,
         address: &str,
