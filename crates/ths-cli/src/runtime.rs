@@ -313,27 +313,27 @@ impl Runtime {
         open_url(&self.read_instance(name)?.endpoints.dashboard)
     }
 
-    pub fn mine(&self, name: &InstanceName, blocks: u32, json: bool) -> Result<()> {
+    fn instance_client(&self, name: &InstanceName) -> Result<(String, reqwest::blocking::Client)> {
         let app_container = format!("{}-app", prefix(name));
         if !container_running(&app_container).unwrap_or(false) {
             bail!("environment {name} is not running; start it with `ths --name {name}`");
         }
         let dashboard = self.read_instance(name)?.endpoints.dashboard;
-        let response = reqwest::blocking::Client::builder()
+        let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(300))
-            .build()?
+            .build()?;
+        Ok((dashboard, client))
+    }
+
+    pub fn mine(&self, name: &InstanceName, blocks: u32, json: bool) -> Result<()> {
+        let (dashboard, client) = self.instance_client(name)?;
+        let result: MineResult = client
             .post(format!("{dashboard}/api/v1/mine"))
             .json(&serde_json::json!({"blocks": blocks}))
             .send()
+            .map_err(anyhow::Error::from)
+            .and_then(decode_response)
             .with_context(|| format!("asking environment {name} to mine {blocks} blocks"))?;
-        let status = response.status();
-        if !status.is_success() {
-            let detail = response
-                .text()
-                .unwrap_or_else(|_| "response body was unreadable".to_owned());
-            bail!("environment {name} rejected mining ({status}): {detail}");
-        }
-        let result: MineResult = response.json().context("decoding mining response")?;
         if json {
             println!("{}", serde_json::to_string_pretty(&result)?);
         } else {
@@ -352,17 +352,11 @@ impl Runtime {
         amount_zatoshi: u64,
         json: bool,
     ) -> Result<()> {
-        let app_container = format!("{}-app", prefix(name));
-        if !container_running(&app_container).unwrap_or(false) {
-            bail!("environment {name} is not running; start it with `ths --name {name}`");
-        }
-        let dashboard = self.read_instance(name)?.endpoints.dashboard;
+        let (dashboard, client) = self.instance_client(name)?;
         let journal = FaucetJournal::open(&self.instance_dir(name))?;
         let intent = format!("address:{address}:{amount_zatoshi}");
         let idempotency_key = journal.key_for(&intent)?;
-        let response = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(300))
-            .build()?
+        let result: FaucetResult = client
             .post(format!("{dashboard}/api/v1/faucet/address"))
             .json(&serde_json::json!({
                 "address": address,
@@ -370,15 +364,9 @@ impl Runtime {
                 "idempotency_key": idempotency_key,
             }))
             .send()
+            .map_err(anyhow::Error::from)
+            .and_then(decode_response)
             .with_context(|| format!("asking environment {name} to fund {address}"))?;
-        let status = response.status();
-        if !status.is_success() {
-            let detail = response
-                .text()
-                .unwrap_or_else(|_| "response body was unreadable".to_owned());
-            bail!("environment {name} rejected faucet request ({status}): {detail}");
-        }
-        let result: FaucetResult = response.json().context("decoding faucet response")?;
         if result.status == "confirmed" && result.block_hash.is_none() {
             bail!("faucet reported confirmation without a block hash; retry the same command");
         }
@@ -418,17 +406,32 @@ impl Runtime {
         pool: &str,
         json: bool,
     ) -> Result<()> {
-        let app_container = format!("{}-app", prefix(name));
-        if !container_running(&app_container).unwrap_or(false) {
-            bail!("environment {name} is not running; start it with `ths --name {name}`");
-        }
-        let dashboard = self.read_instance(name)?.endpoints.dashboard;
+        let (dashboard, client) = self.instance_client(name)?;
+        self.wallet_faucet_with(
+            name,
+            &dashboard,
+            &client,
+            accounts,
+            amount_zatoshi,
+            pool,
+            json,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn wallet_faucet_with(
+        &self,
+        name: &InstanceName,
+        dashboard: &str,
+        client: &reqwest::blocking::Client,
+        accounts: &[u8],
+        amount_zatoshi: u64,
+        pool: &str,
+        json: bool,
+    ) -> Result<()> {
         let journal = FaucetJournal::open(&self.instance_dir(name))?;
         let batch = journal.wallet_batch(pool, amount_zatoshi, accounts)?;
         let intents: Vec<_> = accounts.iter().map(|id| format!("{batch}:{id}")).collect();
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(300))
-            .build()?;
         let mut funded = Vec::new();
         let mut pending = Vec::new();
         let mut failures = Vec::new();
@@ -444,7 +447,7 @@ impl Runtime {
                 }))
                 .send()
                 .with_context(|| format!("asking environment {name} to fund account {account_id}"));
-            match outcome.and_then(decode_activity) {
+            match outcome.and_then(decode_response::<Activity>) {
                 Ok(activity) if activity.status == "confirmed" => funded.push(activity),
                 Ok(activity) => pending.push(activity),
                 Err(error) => failures.push(format!("account {account_id}: {error:#}")),
@@ -503,15 +506,9 @@ impl Runtime {
         memo: Option<&str>,
         json: bool,
     ) -> Result<()> {
-        let app_container = format!("{}-app", prefix(name));
-        if !container_running(&app_container).unwrap_or(false) {
-            bail!("environment {name} is not running; start it with `ths --name {name}`");
-        }
-        let dashboard = self.read_instance(name)?.endpoints.dashboard;
+        let (dashboard, client) = self.instance_client(name)?;
         let idempotency_key = format!("ths-wallet-send-{}", uuid::Uuid::new_v4());
-        let response = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(300))
-            .build()?
+        let activity: Activity = client
             .post(format!("{dashboard}/api/v1/send"))
             .json(&serde_json::json!({
                 "from_account": from,
@@ -523,10 +520,11 @@ impl Runtime {
                 "memo": memo,
             }))
             .send()
+            .map_err(anyhow::Error::from)
+            .and_then(decode_response)
             .with_context(|| {
                 format!("asking environment {name} to send from account {from} to account {to}")
             })?;
-        let activity = decode_activity(response)?;
         if json {
             println!("{}", serde_json::to_string_pretty(&activity)?);
         } else {
@@ -712,7 +710,9 @@ impl Runtime {
     }
 }
 
-fn decode_activity(response: reqwest::blocking::Response) -> Result<Activity> {
+fn decode_response<T: serde::de::DeserializeOwned>(
+    response: reqwest::blocking::Response,
+) -> Result<T> {
     let status = response.status();
     if !status.is_success() {
         let detail = response
@@ -2237,6 +2237,112 @@ mod tests {
         assert!(journal.wallet_batch("ironwood", 100, &[2]).is_ok());
         drop(journal);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// answers loopback requests in turn with canned statuses and bodies, passing on each
+    /// request body.
+    fn serve(responses: Vec<(&'static str, &'static str)>) -> (String, mpsc::Receiver<String>) {
+        use std::io::{BufRead, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (requests, received) = mpsc::channel();
+        std::thread::spawn(move || {
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut request = vec![0; length];
+                reader.read_exact(&mut request).unwrap();
+                requests.send(String::from_utf8(request).unwrap()).unwrap();
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        (url, received)
+    }
+
+    #[test]
+    fn responses_decode_or_report_their_status_and_body() {
+        let (url, _requests) = serve(vec![
+            ("200 OK", r#"{"blocks":1,"hashes":["tip"]}"#),
+            ("409 Conflict", "already claimed"),
+            ("200 OK", "not json"),
+        ]);
+        let client = reqwest::blocking::Client::new();
+        let get = || client.get(&url).send().unwrap();
+
+        let mined: MineResult = decode_response(get()).unwrap();
+        assert_eq!(mined.hashes, ["tip"]);
+        let rejected = decode_response::<MineResult>(get())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(rejected, "rejected (409 Conflict): already claimed");
+        let malformed = format!("{:#}", decode_response::<MineResult>(get()).unwrap_err());
+        assert!(malformed.starts_with("decoding response: "), "{malformed}");
+    }
+
+    #[test]
+    fn wallet_faucet_keeps_funding_after_a_failed_account_and_keeps_its_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = Runtime {
+            root: dir.path().to_path_buf(),
+        };
+        let alpha = name("alpha");
+        fs::create_dir_all(runtime.instance_dir(&alpha)).unwrap();
+        let pending = r#"{"id":"a","kind":"faucet","from_account":null,"to_account":2,"source_pool":"ironwood","destination_pool":"ironwood","amount_zatoshi":100,"txid":"t","block_hash":null,"status":"broadcast"}"#;
+        let funded = r#"{"id":"b","kind":"faucet","from_account":null,"to_account":3,"source_pool":"ironwood","destination_pool":"ironwood","amount_zatoshi":100,"txid":"u","block_hash":"b","status":"confirmed"}"#;
+        let (url, requests) = serve(vec![
+            ("422 Unprocessable Entity", "no funds"),
+            ("200 OK", pending),
+            ("200 OK", funded),
+        ]);
+
+        let error = runtime
+            .wallet_faucet_with(
+                &alpha,
+                &url,
+                &reqwest::blocking::Client::new(),
+                &[1, 2, 3],
+                100,
+                "ironwood",
+                true,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "2 of 3 faucet requests are pending or failed"
+        );
+
+        let requests: Vec<serde_json::Value> = requests
+            .try_iter()
+            .map(|request| serde_json::from_str(&request).unwrap())
+            .collect();
+        assert_eq!(requests.len(), 3);
+        let journal = FaucetJournal::open(&runtime.instance_dir(&alpha)).unwrap();
+        for (account, request) in (1..=3).zip(&requests) {
+            assert_eq!(request["account_id"], account);
+            // the unfinished batch keeps every key, so a retry submits the same ones.
+            assert_eq!(
+                request["idempotency_key"],
+                journal
+                    .key_for(&format!("wallet:ironwood:100:1,2,3:{account}"))
+                    .unwrap()
+            );
+        }
     }
 
     #[test]
