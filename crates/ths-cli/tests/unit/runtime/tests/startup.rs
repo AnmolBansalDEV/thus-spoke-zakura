@@ -90,7 +90,7 @@ fn shutdown_collision_removes_owned_resources_and_preserves_foreign_container() 
     let (_sender, shutdown) = Shutdown::channel();
 
     let error = runtime_for_tests()
-        .start_with(&name("alpha"), true, false, 0, &host, &shutdown)
+        .start_with(&name("alpha"), true, false, false, 0, &host, &shutdown)
         .unwrap_err();
 
     assert!(format!("{error:#}").contains("ths-alpha-init is not owned"));
@@ -122,7 +122,7 @@ fn browser_open_failure_deletes_and_does_not_wait() {
     host.open_url_result = Err("opening http://127.0.0.1:1".into());
     let (_sender, shutdown) = Shutdown::channel();
     let err = runtime_for_tests()
-        .start_with(&name("alpha"), false, false, 0, &host, &shutdown)
+        .start_with(&name("alpha"), false, false, false, 0, &host, &shutdown)
         .unwrap_err();
     assert!(err.to_string().contains("opening"));
     let events = events.lock().unwrap().clone();
@@ -152,7 +152,7 @@ fn no_open_skips_browser_and_waits_for_shutdown() {
         sender.send(Ended::Interrupted).unwrap();
     });
     runtime_for_tests()
-        .start_with(&name("alpha"), true, false, 0, &host, &shutdown)
+        .start_with(&name("alpha"), true, false, false, 0, &host, &shutdown)
         .unwrap();
     let events = events.lock().unwrap().clone();
     assert!(!events.iter().any(|e| e.starts_with("open_url:")));
@@ -167,7 +167,7 @@ fn startup_and_cleanup_failures_are_both_reported_once() {
     host.final_cleanup_failure = Some("Docker inspection failed".into());
     let (_sender, shutdown) = Shutdown::channel();
     let error = runtime_for_tests()
-        .start_with(&name("alpha"), true, false, 0, &host, &shutdown)
+        .start_with(&name("alpha"), true, false, false, 0, &host, &shutdown)
         .unwrap_err();
     let text = format!("{error:#}");
     assert!(text.contains("dashboard readiness timed out"));
@@ -189,7 +189,7 @@ fn interrupt_before_ready_deletes_the_started_instance() {
     host.interrupt_before_ready = true;
     let (_sender, shutdown) = Shutdown::channel();
     let err = runtime_for_tests()
-        .start_with(&name("alpha"), false, false, 0, &host, &shutdown)
+        .start_with(&name("alpha"), false, false, false, 0, &host, &shutdown)
         .unwrap_err();
     assert!(err.to_string().contains("interrupted"));
     let events = events.lock().unwrap().clone();
@@ -204,7 +204,7 @@ fn interrupt_during_allocate_deletes_only_the_named_instance() {
     let (sender, shutdown) = Shutdown::channel();
     sender.send(Ended::Interrupted).unwrap();
     let err = runtime_for_tests()
-        .start_with(&name("alpha"), false, false, 0, &host, &shutdown)
+        .start_with(&name("alpha"), false, false, false, 0, &host, &shutdown)
         .unwrap_err();
     assert!(err.to_string().contains("interrupted"));
     let events = events.lock().unwrap().clone();
@@ -287,7 +287,7 @@ fn deletion_elsewhere_ends_start_without_deleting_again() {
     host.deleted_elsewhere = true;
     let (_sender, shutdown) = Shutdown::channel();
     runtime_for_tests()
-        .start_with(&name("alpha"), true, false, 0, &host, &shutdown)
+        .start_with(&name("alpha"), true, false, false, 0, &host, &shutdown)
         .unwrap();
     let events = events.lock().unwrap().clone();
     let waited = events
@@ -313,4 +313,54 @@ fn shutdown_wait_keeps_a_deletion_notice_that_arrived_first() {
     sender.send(Ended::Interrupted).unwrap();
     assert_eq!(shutdown.wait().unwrap(), Ended::DeletedElsewhere);
     assert!(shutdown.try_interrupted());
+}
+
+#[test]
+fn detach_returns_once_ready_and_leaves_the_environment_running() {
+    let (host, events) = RecordingHost::new();
+    let (_sender, shutdown) = Shutdown::channel();
+    let runtime = runtime_for_tests();
+    runtime
+        .start_with(&name("alpha"), false, true, false, 0, &host, &shutdown)
+        .unwrap();
+    let events = events.lock().unwrap().clone();
+    assert!(events.iter().any(|e| e == "allocate:alpha"));
+    assert!(!events.iter().any(|e| e.starts_with("open_url:")));
+    assert!(!events.iter().any(|e| e.starts_with("wait_for_shutdown")));
+    // Only the fresh-start deletion ran; nothing deleted what was just started.
+    assert_eq!(events.iter().filter(|e| *e == "delete:alpha").count(), 1);
+    assert!(!events.iter().any(|e| e.starts_with("delete_partial")));
+    assert!(!events.iter().any(|e| e.starts_with("final_cleanup")));
+    // The per-name lock is released so `stop` and `reset` can take it.
+    drop(runtime.lock_instance(&name("alpha")).unwrap());
+}
+
+#[test]
+fn detach_failure_before_ready_still_deletes() {
+    let (mut host, events) = RecordingHost::new();
+    host.wait_ready_result = Err("dashboard readiness timed out".into());
+    let (_sender, shutdown) = Shutdown::channel();
+    let error = runtime_for_tests()
+        .start_with(&name("alpha"), false, true, false, 0, &host, &shutdown)
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("dashboard readiness timed out"));
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| e == "final_cleanup:alpha")
+    );
+}
+
+#[test]
+fn detach_interrupted_before_ready_deletes_the_started_instance() {
+    let (mut host, events) = RecordingHost::new();
+    host.interrupt_before_ready = true;
+    let (_sender, shutdown) = Shutdown::channel();
+    let error = runtime_for_tests()
+        .start_with(&name("alpha"), false, true, false, 0, &host, &shutdown)
+        .unwrap_err();
+    assert!(error.to_string().contains("interrupted"));
+    assert!(events.lock().unwrap().iter().any(|e| e == "delete:alpha"));
 }
