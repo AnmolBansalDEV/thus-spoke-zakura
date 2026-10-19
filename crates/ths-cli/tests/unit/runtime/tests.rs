@@ -99,6 +99,16 @@ impl DockerResourceCommands for RecordingDocker {
         };
         match args {
             ["container", "ls", "-a", "--format", "{{.Names}}"] => Ok(listed(&self.containers)),
+            [
+                "container",
+                "ls",
+                "-a",
+                "--no-trunc",
+                "--filter",
+                _,
+                "--format",
+                "{{.ID}}",
+            ] => Ok(String::new()),
             ["volume", "ls", "--format", "{{.Name}}"] => Ok(listed(&self.volumes)),
             ["network", "ls", "--format", "{{.Name}}"] => Ok(listed(&self.networks)),
             [kind, "inspect", target] => {
@@ -151,9 +161,13 @@ struct RecordingHost {
     final_cleanup_failure: Option<String>,
     deleted_elsewhere: bool,
     allocate_delay: Duration,
+    ready_delay: Duration,
     run_status: Option<RuntimeStatus>,
+    allocated_offsets: Mutex<Vec<Option<u16>>>,
     while_running: Option<Box<dyn Fn() -> Ended>>,
     real_child: bool,
+    stopping_seen: Arc<AtomicBool>,
+    ready_in_teardown: Arc<AtomicBool>,
 }
 
 impl RecordingHost {
@@ -170,12 +184,32 @@ impl RecordingHost {
                 final_cleanup_failure: None,
                 deleted_elsewhere: false,
                 allocate_delay: Duration::ZERO,
+                ready_delay: Duration::ZERO,
                 run_status: None,
+                allocated_offsets: Mutex::new(Vec::new()),
                 while_running: None,
                 real_child: false,
+                stopping_seen: Arc::new(AtomicBool::new(false)),
+                ready_in_teardown: Arc::new(AtomicBool::new(false)),
             },
             events,
         )
+    }
+
+    fn note_stopping(&self, runtime: &Runtime, name: &InstanceName) {
+        if runtime
+            .root
+            .join(".locks")
+            .join(format!("{name}.stopping"))
+            .exists()
+        {
+            self.stopping_seen.store(true, Ordering::SeqCst);
+        }
+        if let Ok(instance) = runtime.read_instance(name)
+            && runtime.ready_owner_wrote(name, &instance).unwrap()
+        {
+            self.ready_in_teardown.store(true, Ordering::SeqCst);
+        }
     }
 
     fn push(&self, event: &str) {
@@ -189,6 +223,7 @@ fn verified_report() -> CleanupReport {
         failures: Vec::new(),
         recovery_path: None,
         helpers_finished: true,
+        environment_found: true,
     }
 }
 
@@ -238,6 +273,7 @@ impl StartHost for RecordingHost {
         self.push(&format!("delete:{name}"));
         if later {
             self.push(&format!("final_cleanup:{name}"));
+            self.note_stopping(runtime, name);
         }
         if !later && self.initial_delete_error {
             bail!("resource collision");
@@ -261,6 +297,7 @@ impl StartHost for RecordingHost {
                 failures: vec![message.clone()],
                 recovery_path: Some(runtime.recovery_path(name)),
                 helpers_finished: true,
+                environment_found: true,
             });
         }
         Ok(verified_report())
@@ -273,6 +310,7 @@ impl StartHost for RecordingHost {
         context: &LifecycleContext,
         deadline: Deadline,
     ) -> Result<CleanupReport> {
+        self.note_stopping(runtime, name);
         if let Some(docker) = &self.shutdown_collision {
             let later =
                 self.events.lock().unwrap().iter().any(|event| {
@@ -293,11 +331,12 @@ impl StartHost for RecordingHost {
         _runtime: &Runtime,
         name: &InstanceName,
         shutdown: &Shutdown,
-        _port_offset: u16,
+        port_offset: Option<u16>,
         _context: &LifecycleContext,
         _journal: &mut recovery::RecoveryJournal,
     ) -> Result<AllocatedInstance> {
         self.push(&format!("allocate:{name}"));
+        self.allocated_offsets.lock().unwrap().push(port_offset);
         std::thread::sleep(self.allocate_delay);
         shutdown.check()?;
         Ok(AllocatedInstance {
@@ -322,6 +361,7 @@ impl StartHost for RecordingHost {
         _context: &LifecycleContext,
     ) -> Result<()> {
         self.push("wait_ready");
+        std::thread::sleep(self.ready_delay);
         if self.interrupt_before_ready {
             bail!("interrupted");
         }
